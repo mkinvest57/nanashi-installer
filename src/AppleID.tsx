@@ -1,365 +1,137 @@
 import { useEffect, useRef, useState } from "react";
-import "./AppleID.css";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { load } from "@tauri-apps/plugin-store";
-import { Modal } from "./components/Modal";
-import { toast } from "sonner";
-import { useStore } from "./StoreContext";
-import { useError } from "./ErrorContext";
-import { Certificate } from "./pages/Certificates";
-import { useTranslation } from "react-i18next";
+import { FiCheck, FiLock } from "react-icons/fi";
+import { NanashiButton, NanashiError } from "./components/NanashiGlass";
 
-const storePromise = load("data.json");
+const ANISETTE_SERVER = "https://mac-ani.jkcoxson.com";
+type AppleChallenge = { requestId: string; unknown: boolean; sms: boolean; numbers: { id: number; label: string }[]; selectedNumberId: number | null; hasError: boolean };
 
-export const AppleID = ({
-  loggedInAs,
-  setLoggedInAs,
-  noKeyringAvailable,
-}: {
-  loggedInAs: string | null;
-  setLoggedInAs: (id: string | null) => void;
-  noKeyringAvailable: boolean;
+export const AppleID = ({ loggedInAs, setLoggedInAs, noKeyringAvailable, disabled = false, onBusyChange, onCheckKeyring }: {
+  loggedInAs: string | null; setLoggedInAs: (id: string | null) => void; noKeyringAvailable: boolean;
+  disabled?: boolean; onBusyChange: (busy: boolean) => void; onCheckKeyring: () => void;
 }) => {
-  const { t } = useTranslation();
-  const [storedIds, setStoredIds] = useState<string[]>([]);
-  const [forceUpdateIds, setForceUpdateIds] = useState<number>(0);
-  const [emailInput, setEmailInput] = useState<string>("");
-  const [passwordInput, setPasswordInput] = useState<string>("");
-  const [saveCredentials, setSaveCredentials] = useState<boolean>(false);
-  const [tfaOpen, setTfaOpen] = useState<boolean>(false);
-  const [tfaCode, setTfaCode] = useState<string>("");
-  const [addAccountOpen, setAddAccountOpen] = useState<boolean>(false);
-  const [anisetteServer] = useStore<string>(
-    "anisetteServer3-1",
-    "mac-ani.jkcoxson.com",
-  );
-  const [certs, setCerts] = useState<Certificate[] | null>(null);
-  const [selectedSerials, setSelectedSerials] = useState<string[]>([]);
-  const [chooseCertsOpen, setChooseCertsOpen] = useState<boolean>(false);
-  const { err } = useError();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [ready, setReady] = useState(false);
+  const [canceling, setCanceling] = useState(false);
+  const [code, setCode] = useState("");
+  const [codeSent, setCodeSent] = useState(false);
+  const [challenge, setChallenge] = useState<AppleChallenge | null>(null);
+  const needsCode = challenge !== null && !challenge.unknown;
+  const [challengeSending, setChallengeSending] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const attempt = useRef(0);
+  const active = useRef(false);
+  const mounted = useRef(true);
+  const codeInput = useRef<HTMLInputElement>(null);
+  const deviceMethod = useRef<HTMLButtonElement>(null);
+  const responseInFlight = useRef(false);
+  const pendingLogin = useRef<Promise<unknown> | null>(null);
 
+  function setWorking(value: boolean) { active.current = value; setBusy(value); onBusyChange(value); }
   useEffect(() => {
-    let getLoggedInAs = async () => {
-      let account = await invoke<string | null>("logged_in_as");
-      setLoggedInAs(account);
-    };
-    let getStoredIds = async () => {
-      const store = await storePromise;
-      let ids = (await store.get<string[]>("ids")) ?? [];
-      setStoredIds(ids);
-    };
-
-    getLoggedInAs();
-    getStoredIds();
-  }, [forceUpdateIds]);
-
-  useEffect(() => {
-    setSelectedSerials(certs?.map((c) => c.serialNumber) ?? []);
-  }, [certs]);
-
-  const listenerAdded = useRef<boolean>(false);
-  const unlisten = useRef<() => void>(() => {});
-
-  useEffect(() => {
-    if (!listenerAdded.current) {
-      (async () => {
-        const unlistenFn = await listen("2fa-required", () => {
-          setTfaOpen(true);
-        });
-        unlisten.current = unlistenFn;
-      })();
-      listenerAdded.current = true;
-    }
-    return () => {
-      unlisten.current();
-    };
-  }, []);
-
-  const certListenerAdded = useRef<boolean>(false);
-  const certUnlisten = useRef<() => void>(() => {});
-
-  useEffect(() => {
-    if (!certListenerAdded.current) {
-      (async () => {
-        const unlistenFn = await listen<Certificate[]>(
-          "max-certs-reached",
-          (certs) => {
-            setCerts(certs.payload);
-          },
-        );
-        certUnlisten.current = unlistenFn;
-      })();
-      certListenerAdded.current = true;
-    }
-    return () => {
-      certUnlisten.current();
-    };
-  }, []);
-
-  return (
-    <>
-      <h2 style={{ marginTop: 0 }}>{t("apple_id.title")}</h2>
-      <div className="credentials-container">
-        {loggedInAs && (
-          <div className="logged-in-as card green">
-            <div className="logged-info">
-              <span className="logged-label">{t("apple_id.logged_in_as")}</span>
-              <span className="logged-value">{loggedInAs}</span>
-            </div>
-            <div className="action-row">
-              <button
-                type="button"
-                className="action-button danger"
-                onClick={async () => {
-                  let promise = async () => {
-                    await invoke("invalidate_account");
-                    setForceUpdateIds((v) => v + 1);
-                  };
-                  toast.promise(promise, {
-                    loading: t("apple_id.signing_out"),
-                    error: (e) => err(t("apple_id.sign_out_failed"), e),
-                    success: t("apple_id.signed_out_success"),
-                  });
-                }}
-              >
-                {t("apple_id.sign_out")}
-              </button>
-            </div>
-          </div>
-        )}
-        {storedIds.length > 0 && (
-          <div className="stored-ids">
-            <h3 style={{ margin: 0 }}>{t("apple_id.saved_logins")}</h3>
-            <div className="stored-container card">
-              {storedIds.map((id) => (
-                <div key={id} className="stored">
-                  <div className="stored-email">{id}</div>
-                  <div className="action-row">
-                    {!loggedInAs && (
-                      <button
-                        type="button"
-                        className="action-button primary"
-                        onClick={() => {
-                          let promise = async () => {
-                            await invoke("login_stored", {
-                              email: id,
-                              anisetteServer,
-                            });
-                            setForceUpdateIds((v) => v + 1);
-                          };
-                          toast.promise(promise, {
-                            loading: t("apple_id.logging_in"),
-                            success: t("apple_id.logged_in_success"),
-                            error: (e) => err(t("apple_id.login_failed"), e),
-                          });
-                        }}
-                      >
-                        {t("apple_id.sign_in")}
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      className="action-button danger"
-                      onClick={async () => {
-                        let promise = async () => {
-                          await invoke("delete_account", { email: id });
-                          setForceUpdateIds((v) => v + 1);
-                        };
-                        toast.promise(promise, {
-                          loading: t("apple_id.deleting"),
-                          error: (e) => err(t("apple_id.deletion_failed"), e),
-                          success: t("apple_id.deleted_success"),
-                        });
-                      }}
-                    >
-                      {t("common.delete")}
-                    </button>
-                  </div>
-                </div>
-              ))}
-              {!addAccountOpen && (
-                <div
-                  className="stored add-account"
-                  onClick={() => {
-                    setAddAccountOpen(true);
-                  }}
-                >
-                  {t("apple_id.add_account")}
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-        {((loggedInAs === null && storedIds.length === 0) ||
-          addAccountOpen) && (
-          <div className="new-login">
-            {storedIds.length > 0 && <h3>{t("apple_id.new_login")}</h3>}
-            <form
-              className="credentials"
-              onSubmit={async (e) => {
-                e.preventDefault();
-                if (!emailInput || !passwordInput) {
-                  toast.warning(t("apple_id.enter_email_password"));
-                  return;
-                }
-                // if (!emailInput.includes("@")) {
-                //   toast.warning(t("apple_id.valid_email"));
-                //   return;
-                // }
-                let promise = async () => {
-                  await invoke("login_new", {
-                    email: emailInput,
-                    password: passwordInput,
-                    saveCredentials: saveCredentials,
-                    anisetteServer,
-                  });
-                  setForceUpdateIds((v) => v + 1);
-                };
-                toast.promise(promise, {
-                  loading: t("apple_id.logging_in"),
-                  success: t("apple_id.logged_in_success"),
-                  error: (e) => err(t("apple_id.login_failed"), e),
-                });
-              }}
-            >
-              <input
-                type="text"
-                placeholder={t("apple_id.email_placeholder")}
-                value={emailInput}
-                onChange={(e) => setEmailInput(e.target.value)}
-              />
-              <input
-                type="password"
-                placeholder={t("apple_id.password_placeholder")}
-                value={passwordInput}
-                onChange={(e) => setPasswordInput(e.target.value)}
-              />
-              {noKeyringAvailable ? (
-                <p className="settings-hint credentials-warning">
-                  {t("apple_id.no_keyring_available")}
-                </p>
-              ) : (
-                <div className="save-credentials">
-                  <input
-                    type="checkbox"
-                    id="save-credentials"
-                    checked={saveCredentials}
-                    onChange={(e) => setSaveCredentials(e.target.checked)}
-                  />
-                  <label htmlFor="save-credentials">
-                    {t("apple_id.save_credentials")}
-                  </label>
-                </div>
-              )}
-              <button type="submit">{t("apple_id.login")}</button>
-              {addAccountOpen && storedIds.length > 0 && (
-                <button
-                  onClick={() => {
-                    setAddAccountOpen(false);
-                  }}
-                >
-                  {t("common.cancel")}
-                </button>
-              )}
-            </form>
-          </div>
-        )}
-      </div>
-      <Modal sizeFit isOpen={tfaOpen} zIndex={2000}>
-        <h2>{t("apple_id.two_factor_title")}</h2>
-        <p>{t("apple_id.two_factor_prompt")}</p>
-        <form
-          onSubmit={async (e) => {
-            e.preventDefault();
-            if (tfaCode.length !== 6) {
-              toast.warning(t("apple_id.valid_6digit"));
+    mounted.current = true;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    async function prepare() {
+      try {
+        const remove = await listen<AppleChallenge>("2fa-required", event => {
+          if (!disposed && active.current) {
+            const request = event.payload;
+            if (!request || typeof request.requestId !== "string" || typeof request.unknown !== "boolean" || !Array.isArray(request.numbers)) {
+              setError({ type: "auth", message: "Unsupported verification request" });
               return;
             }
-            await emit("2fa-recieved", tfaCode);
-            setTfaOpen(false);
-            setTfaCode("");
-          }}
-        >
-          <input
-            type="text"
-            placeholder={t("apple_id.verification_placeholder")}
-            value={tfaCode}
-            onChange={(e) => setTfaCode(e.target.value)}
-            style={{ marginRight: "0.5em" }}
-          />
-          <button type="submit">{t("apple_id.submit")}</button>
-        </form>
-      </Modal>
-      <Modal sizeFit isOpen={certs !== null} zIndex={2000}>
-        <h2 className="cert-header">{t("apple_id.max_certs_title")}</h2>
-        <p className="certs-desc">{t("apple_id.max_certs_desc")}</p>
-        <p
-          className="certs-see"
-          role="button"
-          tabIndex={0}
-          onClick={() => setChooseCertsOpen((v) => !v)}
-        >
-          {chooseCertsOpen
-            ? t("apple_id.hide_certificate_list")
-            : t("apple_id.choose_what_to_revoke")}
-        </p>
-        {chooseCertsOpen && certs && (
-          <div className="certs-list">
-            {certs.map((cert) => (
-              <div
-                key={cert.serialNumber}
-                className="cert-item"
-                onClick={() => {
-                  setSelectedSerials((prev) => {
-                    if (prev.includes(cert.serialNumber)) {
-                      return prev.filter((s) => s !== cert.serialNumber);
-                    } else {
-                      return [...prev, cert.serialNumber];
-                    }
-                  });
-                }}
-              >
-                <input
-                  type="checkbox"
-                  id={cert.serialNumber}
-                  name={cert.serialNumber}
-                  value={cert.serialNumber}
-                  checked={selectedSerials.includes(cert.serialNumber)}
-                />
-                <label htmlFor={cert.serialNumber}>
-                  {cert.name} - {cert.machineName}
-                </label>
-              </div>
-            ))}
-          </div>
-        )}
-        <div className="certs-buttons">
-          <button
-            className="action-button primary"
-            onClick={async () => {
-              await emit(
-                "max-certs-response",
-                selectedSerials.length > 0 ? selectedSerials : null,
-              );
-              setCerts(null);
-              setChooseCertsOpen(false);
-            }}
-          >
-            {t("apple_id.continue")}
-          </button>
-          <button
-            className="action-button danger"
-            onClick={async () => {
-              await emit("max-certs-response", null);
-              setCerts(null);
-              setChooseCertsOpen(false);
-            }}
-          >
-            {t("common.cancel")}
-          </button>
-        </div>
-      </Modal>
-    </>
-  );
+            setChallenge(request); setCode(""); setCodeSent(false);
+            setChallengeSending(false); responseInFlight.current = false;
+          }
+        });
+        if (disposed) { remove(); return; }
+        unlisten = remove;
+        const account = await invoke<string | null>("logged_in_as");
+        if (!disposed) { setLoggedInAs(account); setReady(true); }
+      } catch (failure) { if (!disposed) setError(failure); }
+    }
+    void prepare();
+    return () => {
+      disposed = true; mounted.current = false; unlisten?.(); attempt.current += 1;
+      if (active.current) void invoke("cancel_login").catch(() => {});
+      active.current = false; onBusyChange(false);
+    };
+  }, [setLoggedInAs, onBusyChange]);
+  useEffect(() => { if (needsCode) codeInput.current?.focus(); }, [needsCode, challenge?.requestId]);
+  useEffect(() => { if (challenge?.unknown) deviceMethod.current?.focus(); }, [challenge]);
+
+  async function login() {
+    if (active.current || disabled || noKeyringAvailable || !ready || !email.trim() || !password) return;
+    const request = ++attempt.current;
+    setError(null); setCodeSent(false); setChallenge(null); setWorking(true);
+    try {
+      const pending = invoke("login_new", { email: email.trim(), password, saveCredentials: false, anisetteServer: ANISETTE_SERVER });
+      pendingLogin.current = pending;
+      setPassword("");
+      await pending;
+      if (!mounted.current || request !== attempt.current) return;
+      const account = await invoke<string | null>("logged_in_as");
+      if (!account) throw { type: "auth", message: "Session unavailable" };
+      if (mounted.current && request === attempt.current) setLoggedInAs(account);
+    } catch (failure) { if (mounted.current && request === attempt.current) setError(failure); }
+    finally {
+      if (mounted.current && request === attempt.current) { pendingLogin.current = null; setWorking(false); setChallenge(null); setCode(""); setPassword(""); }
+    }
+  }
+  async function cancelLogin() {
+    attempt.current += 1;
+    setCanceling(true);
+    try {
+      await invoke("cancel_login");
+      // Cancellation is a request; the native login must release its lock first.
+      await pendingLogin.current?.catch(() => undefined);
+      pendingLogin.current = null;
+      setWorking(false); setChallenge(null); setCode(""); setPassword("");
+    }
+    catch (failure) { setError(failure); }
+    finally { setCanceling(false); }
+  }
+  async function sendCode() {
+    if (!/^\d{6}$/.test(code) || canceling || !challenge || challenge.unknown || responseInFlight.current) return;
+    const requestId = challenge.requestId, submittedCode = code;
+    responseInFlight.current = true; setChallengeSending(true);
+    setCode(""); setCodeSent(true);
+    try { await emit("2fa-recieved", { requestId, action: "submit-code", code: submittedCode }); setChallenge(current => current?.requestId === requestId ? null : current); }
+    catch (failure) { setError(failure); }
+    finally { responseInFlight.current = false; setChallengeSending(false); }
+  }
+  async function requestCode(action: "request-device-code" | "request-sms-code", phoneId?: number) {
+    if (!challenge?.unknown || canceling || responseInFlight.current) return;
+    const requestId = challenge.requestId;
+    responseInFlight.current = true; setChallengeSending(true);
+    try { await emit("2fa-recieved", { requestId, action, ...(phoneId !== undefined ? { phoneId } : {}) }); setChallenge(current => current?.requestId === requestId ? null : current); }
+    catch (failure) { setError(failure); }
+    finally { responseInFlight.current = false; setChallengeSending(false); }
+  }
+  async function signOut() {
+    setWorking(true); setError(null);
+    try { await invoke("invalidate_account"); setLoggedInAs(null); setPassword(""); }
+    catch (failure) { setError(failure); }
+    finally { setWorking(false); }
+  }
+
+  return <div className="ni-account">
+    {noKeyringAvailable && <div className="ni-error" role="alert"><strong>Déverrouillez le trousseau de l’ordinateur</strong><p>Il protège les éléments de signature Apple, même sans enregistrer le mot de passe. La connexion reste bloquée tant qu’il est indisponible.</p><NanashiButton type="button" onClick={onCheckKeyring} disabled={disabled}>Vérifier le trousseau</NanashiButton></div>}
+    {loggedInAs ? <div className="ni-notice ni-account-connected"><FiCheck aria-hidden="true" /><div><strong>Compte Apple connecté</strong><p>{loggedInAs}</p><button className="ni-text-button" disabled={disabled || busy} type="button" onClick={() => void signOut()}>Utiliser un autre compte</button></div></div>
+      : <form className="ni-login-form" onSubmit={event => { event.preventDefault(); void login(); }}>
+        <label htmlFor="apple-email">Compte Apple<input id="apple-email" name="apple-email" type="text" inputMode="email" autoComplete="username" autoCapitalize="none" spellCheck={false} value={email} onChange={event => setEmail(event.target.value)} disabled={disabled || busy || noKeyringAvailable} placeholder="Votre adresse e-mail ou numéro" required /></label>
+        <label htmlFor="apple-password">Mot de passe<input id="apple-password" name="apple-password" type="password" autoComplete="current-password" value={password} onChange={event => setPassword(event.target.value)} disabled={disabled || busy || noKeyringAvailable} required /></label>
+        <p className="ni-caption"><FiLock aria-hidden="true" />Le mot de passe n’est pas mémorisé. La validation Apple peut demander un code sur votre appareil.</p>
+        {!busy && <NanashiButton primary type="submit" disabled={disabled || noKeyringAvailable || !ready || !email.trim() || !password}>Se connecter à Apple</NanashiButton>}
+      </form>}
+    {challenge?.hasError && <p className="ni-notice" role="status">Apple demande une nouvelle validation. Vérifiez la méthode choisie et utilisez le dernier code reçu.</p>}
+    {challenge?.unknown && <section className="ni-code-panel" aria-labelledby="verification-method"><h3 id="verification-method">Où recevoir le code Apple ?</h3><p>Choisissez une méthode proposée par votre compte.</p><div className="ni-methods"><button ref={deviceMethod} className="ni-button ni-primary" type="button" disabled={canceling || challengeSending} onClick={() => void requestCode("request-device-code")}>Sur mes appareils Apple</button>{challenge.numbers.filter(number => Number.isInteger(number.id) && typeof number.label === "string").map(number => <NanashiButton key={number.id} type="button" disabled={canceling || challengeSending} onClick={() => void requestCode("request-sms-code", number.id)}>Par SMS · ••••{number.label.replace(/\D/g, "").slice(-2)}</NanashiButton>)}</div></section>}
+    {needsCode && <section className="ni-code-panel" aria-labelledby="verification-title"><h3 id="verification-title">{challenge?.sms ? "Le code reçu par SMS" : "Le code reçu sur votre appareil Apple"}</h3><p>Saisissez les six chiffres pour terminer la connexion.</p><form onSubmit={event => { event.preventDefault(); void sendCode(); }}><label htmlFor="apple-code">Code de validation<input ref={codeInput} id="apple-code" type="text" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} value={code} onChange={event => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))} disabled={canceling || challengeSending} /></label><NanashiButton primary type="submit" disabled={code.length !== 6 || canceling || challengeSending}>Valider le code</NanashiButton></form></section>}
+    {busy && <div className="ni-auth-status"><p role="status">{canceling ? "Annulation en cours…" : needsCode ? "En attente du code Apple." : codeSent ? "Vérification du code…" : "Connexion à Apple en cours…"}</p><button className="ni-text-button" type="button" disabled={canceling} onClick={() => void cancelLogin()}>Annuler la connexion</button></div>}
+    {error !== null && <NanashiError error={error} />}
+  </div>;
 };

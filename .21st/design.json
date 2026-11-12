@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "project": {
+    "name": "Nanashi Installer",
+    "productType": "Desktop iPhone setup assistant",
+    "stack": [
+      "Tauri 2",
+      "Rust",
+      "React",
+      "TypeScript",
+      "CSS"
+    ]
+  },
+  "sources": {
+    "tokens": [
+      "src/Nanashi.css"
+    ],
+    "components": [
+      "src/components/NanashiGlass.tsx",
+      "src/components/NanashiDevice.tsx",
+      "src/AppleID.tsx"
+    ],
+    "assets": [
+      "public/nanashi.png",
+      "public/nanashi-iphone-qr.svg"
+    ],
+    "instructions": [
+      "README.md",
+      "LICENSE",
+      "LICENSE-BRANDING"
+    ]
+  },
+  "design": {
+    "colorMode": "dark",
+    "colors": {
+      "canvas": "#0F172A",
+      "surface": "#1E293B",
+      "text": "#F8FAFC",
+      "muted": "#A7B3C8",
+      "accent": "#BFDBFE"
+    },
+    "typography": {
+      "body": "Native system sans",
+      "numbers": "Tabular where applicable"
+    },
+    "spacing": {},
+    "radius": {
+      "panel": "24px",
+      "control": "999px"
+    },
+    "shadows": {},
+    "motion": {
+      "duration": "160ms",
+      "reducedMotion": "No animation or smooth scroll",
+      "background": "Static"
+    },
+    "density": "calm"
+  },
+  "components": {
+    "installed": [],
+    "preferredPrimitives": [
+      "NanashiGlass",
+      "NanashiButton",
+      "NanashiError"
+    ],
+    "patterns": []
+  },
+  "constraints": {
+    "must": [
+      "Preserve Nanashi Cold Glass identity and upstream attribution",
+      "No health data or analytics on website",
+      "Minimum 44px control targets; keyboard and reduced motion support",
+      "Only published and validated artifacts can become download links",
+      "21st-derived visual patterns with visible exact source links"
+    ],
+    "avoid": [
+      "Perpetual motion",
+      "Heavy graphics runtimes",
+      "Fake download URLs",
+      "Private health screenshots",
+      "Unconfirmed MIT license claims"
+    ]
+  },
+  "decisions": [
+    {
+      "decision": "Use the existing Nanashi Cold Glass primitives and Harbor Blue tokens for a four-stage French setup assistant.",
+      "reason": "Keep device choice, Apple authentication, verified manager preparation and phone handoff distinct. Reuse the existing retrieved 21st adaptations without another animation or onboarding runtime."
+    }
+  ],
+  "evidence": [],
+  "generatedAt": "2026-11-12T01:18:37.112Z"
+}

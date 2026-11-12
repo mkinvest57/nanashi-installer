@@ -1,40 +1,33 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "iloader",
-  "version": "2.4.1",
-  "identifier": "me.nabdev.iloader",
+  "productName": "Nanashi Installer",
+  "version": "0.1.0",
+  "identifier": "com.rayanmakhlouf.nanashi.installer",
   "build": {
-    "beforeDevCommand": "bun run dev",
+    "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bun run build",
+    "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
-        "title": "iloader",
-        "width": 800,
-        "height": 600,
-        "minHeight": 300,
-        "minWidth": 400
+        "title": "Nanashi",
+        "width": 980,
+        "height": 760,
+        "minHeight": 560,
+        "minWidth": 640
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost https://asset.localhost data:; connect-src ipc: http://ipc.localhost https://ipc.localhost; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
     }
   },
-  "plugins": {
-    "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEUwRDc0NjBERkEzN0U1MzYKUldRMjVUZjZEVWJYNFA0eWtoOGRyRFBtc3BnN20zWFpzbmVNaiswVmhlNm9GUzFzTjRPYmxSaHIK",
-      "endpoints": [
-        "https://github.com/nab138/iloader/releases/latest/download/latest.json"
-      ]
-    }
-  },
+  "plugins": {},
   "bundle": {
     "active": true,
     "targets": "all",
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "category": "Utility",
     "icon": [
       "icons/32x32.png",
@@ -42,6 +35,8 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "shortDescription": "Installateur Nanashi pour iPhone",
+    "longDescription": "Independent Nanashi setup assistant based on the open-source iloader engine."
   }
 }

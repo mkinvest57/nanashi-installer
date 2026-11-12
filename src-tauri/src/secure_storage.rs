@@ -1,55 +1,63 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use isideload::util::{
-    fs_storage::FsStorage, keyring_storage::KeyringStorage, storage::SideloadingStorage,
-};
-use tauri::{AppHandle, Manager};
-use tracing::warn;
+use isideload::util::{keyring_storage::KeyringStorage, storage::SideloadingStorage};
+use tauri::AppHandle;
 
 use crate::error::AppError;
 
-static FORCE_DISABLE_KEYRING: AtomicBool = AtomicBool::new(false);
-
-#[tauri::command]
-pub fn force_disable_keyring(force: bool) {
-    FORCE_DISABLE_KEYRING.store(force, Ordering::Relaxed);
-
-    if force {
-        warn!("Keyring has been forcefully disabled by the user.");
-    } else {
-        let available = check_keyring_available();
-        if !available {
-            warn!("Keyring is not available and cannot be enabled.");
-        }
-    }
-}
+// Never share credentials, certificates or ADI state with the upstream installer.
+pub const KEYRING_SERVICE: &str = "nanashi-installer";
 
 #[tauri::command]
 pub fn keyring_available() -> bool {
-    !FORCE_DISABLE_KEYRING.load(Ordering::Relaxed) && check_keyring_available()
+    // A unique, disposable entry avoids reading or replacing existing credentials.
+    let Ok(entry) = keyring::Entry::new(
+        KEYRING_SERVICE,
+        &format!("availability-probe-{}", uuid::Uuid::new_v4()),
+    ) else {
+        return false;
+    };
+    if entry.set_password("nanashi-keyring-probe").is_err() {
+        return false;
+    }
+    let available = entry
+        .get_password()
+        .is_ok_and(|value| value == "nanashi-keyring-probe");
+    let removed = entry.delete_credential().is_ok();
+    available && removed
 }
 
-fn check_keyring_available() -> bool {
-    let entry = keyring::Entry::new("iloader", "test");
-    if let Ok(entry) = entry {
-        return entry.set_password("test").is_ok() && entry.get_password().is_ok();
+fn require_secure_storage(available: bool) -> Result<(), AppError> {
+    if available {
+        Ok(())
+    } else {
+        Err(AppError::Keyring(
+            "Le trousseau sécurisé est indisponible. Déverrouillez-le puis réessayez. Aucun secret ne sera enregistré dans un fichier.".into(),
+        ))
     }
-    false
 }
 
 pub fn create_sideloading_storage(
-    app: &AppHandle,
+    _app: &AppHandle,
 ) -> Result<Box<dyn SideloadingStorage>, AppError> {
-    if keyring_available() {
-        Ok(Box::new(KeyringStorage::new("iloader".to_string())))
-    } else {
-        warn!(
-            "Keyring is not available, falling back to filesystem storage for sideloading data. This is insecure!"
-        );
-        Ok(Box::new(FsStorage::new(
-            app.path().app_data_dir().map_err(|e| {
-                AppError::Misc(format!("Failed to get app data directory: {:?}", e))
-            })?,
-        )))
+    require_secure_storage(keyring_available())?;
+    Ok(Box::new(KeyringStorage::new(KEYRING_SERVICE.to_string())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_keyring_is_a_hard_failure() {
+        assert!(matches!(
+            require_secure_storage(false),
+            Err(AppError::Keyring(_))
+        ));
+        assert!(require_secure_storage(true).is_ok());
+    }
+
+    #[test]
+    fn namespace_does_not_reuse_upstream_credentials() {
+        assert_eq!(KEYRING_SERVICE, "nanashi-installer");
+        assert_ne!(KEYRING_SERVICE, "iloader");
     }
 }

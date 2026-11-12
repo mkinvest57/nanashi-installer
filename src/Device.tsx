@@ -10,7 +10,7 @@ import { AppError } from "./errors";
 export type DeviceInfo = {
   name: string;
   id: number;
-  uuid: string;
+  udid: string;
   connectionType: "USB" | "Network" | "Unknown";
   version: string;
 };

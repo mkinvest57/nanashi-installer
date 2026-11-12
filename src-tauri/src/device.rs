@@ -32,6 +32,57 @@ pub struct DeviceInfoWithPairing {
 pub type DeviceInfoMutex = Mutex<Option<DeviceInfoWithPairing>>;
 pub type PairingCancelToken = Mutex<Option<CancellationToken>>;
 
+// Selection, cancellation and commit share one lock order: cancellation first,
+// selected device second. A cancelled request can never replace the selection.
+struct PairingAttempt<'a> {
+    cancel_state: &'a PairingCancelToken,
+    token: CancellationToken,
+}
+
+impl<'a> PairingAttempt<'a> {
+    fn begin(cancel_state: &'a PairingCancelToken, device_state: &DeviceInfoMutex) -> Self {
+        let token = CancellationToken::new();
+        let mut current = cancel_state.lock().unwrap();
+        if let Some(previous) = current.replace(token.clone()) {
+            previous.cancel();
+        }
+        *device_state.lock().unwrap() = None;
+        Self {
+            cancel_state,
+            token,
+        }
+    }
+}
+
+impl Drop for PairingAttempt<'_> {
+    fn drop(&mut self) {
+        self.token.cancel();
+        self.cancel_state.lock().unwrap().take();
+    }
+}
+
+fn commit_selected_device(
+    cancel_state: &PairingCancelToken,
+    device_state: &DeviceInfoMutex,
+    token: &CancellationToken,
+    device: DeviceInfoWithPairing,
+) -> Result<(), AppError> {
+    let _cancel = cancel_state.lock().unwrap();
+    if token.is_cancelled() {
+        return Err(AppError::Canceled("Association de l’iPhone".into()));
+    }
+    *device_state.lock().unwrap() = Some(device);
+    Ok(())
+}
+
+fn cancel_pairing_selection(cancel_state: &PairingCancelToken, device_state: &DeviceInfoMutex) {
+    let mut current = cancel_state.lock().unwrap();
+    if let Some(token) = current.take() {
+        token.cancel();
+    }
+    *device_state.lock().unwrap() = None;
+}
+
 #[tauri::command]
 pub async fn list_devices() -> Result<Vec<Result<DeviceInfo, AppError>>, AppError> {
     let mut usbmuxd = get_usbmuxd().await?;
@@ -127,47 +178,36 @@ pub async fn set_selected_device(
     cancel_state: State<'_, PairingCancelToken>,
     device: Option<DeviceInfo>,
 ) -> Result<(), AppError> {
-    if device.is_none() {
-        let mut device_state = device_state.lock().unwrap();
-        *device_state = None;
+    let _operation = crate::nanashi::begin_exclusive_operation()?;
+    let Some(device) = device else {
+        cancel_pairing_selection(&cancel_state, &device_state);
         return Ok(());
-    }
-
-    let mut usbmuxd = get_usbmuxd().await?;
-
-    let token = tokio_util::sync::CancellationToken::new();
-    {
-        let mut guard = cancel_state.lock().unwrap();
-        if let Some(old) = guard.replace(token.clone()) {
-            old.cancel();
-        }
-    }
-
-    let pairing_result =
-        pairing_file(&app, device.as_ref().unwrap(), &mut usbmuxd, token.clone()).await;
-
-    if !token.is_cancelled() {
-        let mut guard = cancel_state.lock().unwrap();
-        *guard = None;
-    }
-
-    let pairing = pairing_result?;
-
-    let device_with_pairing = DeviceInfoWithPairing {
-        info: device.unwrap(),
-        pairing,
     };
-    let mut device_state = device_state.lock().unwrap();
-    *device_state = Some(device_with_pairing);
-    Ok(())
+    // Register cancellation before the first await, including USB connection.
+    let attempt = PairingAttempt::begin(&cancel_state, &device_state);
+    let mut usbmuxd = tokio::select! {
+        _ = attempt.token.cancelled() => return Err(AppError::Canceled("Association de l’iPhone".into())),
+        connection = get_usbmuxd() => connection?,
+    };
+    let pairing = pairing_file(&app, &device, &mut usbmuxd, attempt.token.clone()).await?;
+    commit_selected_device(
+        &cancel_state,
+        &device_state,
+        &attempt.token,
+        DeviceInfoWithPairing {
+            info: device,
+            pairing,
+        },
+    )
 }
 
 #[tauri::command]
-pub async fn cancel_pairing(cancel_state: State<'_, PairingCancelToken>) -> Result<(), AppError> {
-    let mut guard = cancel_state.lock().unwrap();
-    if let Some(token) = guard.take() {
-        token.cancel();
-    }
+pub async fn cancel_pairing(
+    cancel_state: State<'_, PairingCancelToken>,
+    device_state: State<'_, DeviceInfoMutex>,
+) -> Result<(), AppError> {
+    // Cancellation must remain available while the exclusive operation is held.
+    cancel_pairing_selection(&cancel_state, &device_state);
     Ok(())
 }
 
@@ -194,4 +234,57 @@ pub async fn get_provider_from_connection(
 
     let provider = device.to_provider(UsbmuxdAddr::from_env_var().unwrap(), "iloader");
     Ok(provider)
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    fn phone() -> DeviceInfoWithPairing {
+        DeviceInfoWithPairing {
+            info: DeviceInfo {
+                name: "Test phone".into(),
+                id: 1,
+                udid: "PHONE-B".into(),
+                connection_type: "USB".into(),
+                version: "27.0".into(),
+            },
+            pairing: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn cancelled_pairing_never_commits_a_late_result() {
+        let cancel = PairingCancelToken::new(None);
+        let selected = DeviceInfoMutex::new(Some(phone()));
+        let attempt = PairingAttempt::begin(&cancel, &selected);
+        assert!(selected.lock().unwrap().is_none());
+        cancel_pairing_selection(&cancel, &selected);
+        assert!(commit_selected_device(&cancel, &selected, &attempt.token, phone()).is_err());
+        assert!(selected.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn cancellation_and_commit_race_always_ends_without_a_selected_phone() {
+        for _ in 0..64 {
+            let token = CancellationToken::new();
+            let cancel = Arc::new(PairingCancelToken::new(Some(token.clone())));
+            let selected = Arc::new(DeviceInfoMutex::new(None));
+            let start = Arc::new(Barrier::new(2));
+            let commit = {
+                let cancel = cancel.clone();
+                let selected = selected.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    let _ = commit_selected_device(&cancel, &selected, &token, phone());
+                })
+            };
+            start.wait();
+            cancel_pairing_selection(&cancel, &selected);
+            commit.join().unwrap();
+            assert!(selected.lock().unwrap().is_none());
+        }
+    }
 }

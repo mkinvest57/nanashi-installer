@@ -1,155 +1,48 @@
-<a href="https://iloader.app">
-  <picture align="left" >
-    <source media="(prefers-color-scheme: dark)" srcset="/iloader.svg">
-    <img align="left" width="90" height="90" src="/iloader-dark.svg">
-  </picture>
-  
-  <div id="user-content-toc">
-    <ul style="list-style: none;">
-      <summary>
-        <h1>iloader</h1>
-      </summary>
-    </ul>
-  </div>
-</a>
+# Nanashi Installer
 
----
+An independent, focused iPhone setup assistant based on [iloader 2.4.1](https://github.com/nab138/iloader/tree/v2.4.1). It prepares the official AltStore Classic 2.3.3 release, then hands off to the Nanashi website for the Apple confirmations and the Nanashi installation.
 
-[![Build iloader](https://img.shields.io/github/actions/workflow/status/nab138/iloader/build.yml?style=flat&logo=github&logoColor=white&label=Build%20iloader)](https://github.com/nab138/iloader/actions/workflows/build.yml) ![Downloads](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fnab138%2F28258aff7e3f1d3a3084a21f4cff2e57%2Fraw%2Filoader_downloads.json&style=flat)
-[![Sponsor](https://img.shields.io/static/v1?label=Sponsor&message=%E2%9D%A4&logo=GitHub&color=%23fe8e86)](https://github.com/sponsors/nab138)
+This is a preview implementation. Build and simulated UI checks do not establish successful Apple authentication, installation, migration, Health entitlements or background renewal on a physical iPhone. Do not describe the preview as an obstacle-free replacement until those checks have been performed.
 
-Install SideStore (or other apps) and import your pairing file with ease
+## What it does
 
-**This repository and [iloader.app](https://iloader.app) are the only official ways to download iloader. There is also an unofficial [Homebrew cask](https://formulae.brew.sh/cask/iloader), an unofficial [AUR package](https://aur.archlinux.org/packages/iloader-bin), and an unofficial [Fedora COPR repository](https://copr.fedorainfracloud.org/coprs/anudeepd/iloader) maintained by the community. Do not download from any other sources or websites.**
+1. Requires an explicitly selected, paired iPhone running iOS 17.4 or later.
+2. Signs in to Apple through the open-source iloader/isideload implementation, with native 2FA and cancellable, bounded requests.
+3. Downloads a pinned official AltStore IPA over HTTPS, checking its exact size and SHA-256 before signing.
+4. Embeds the supported installation metadata and places the pairing file in AltStore's documented local container.
+5. Opens a first-party phone handoff: trust/developer mode if required, LocalDevVPN, Remote AltServer, Apple login, and the validated Nanashi installation link.
 
-<img width="1918" height="998" alt="iloader0" src="https://github.com/user-attachments/assets/93cd135d-6d89-46ee-9b9f-12c596806911" />
+Nanashi itself is signed by AltStore, not by the bootstrap engine: the existing Health, App Groups, widget and keychain entitlements must not be silently simplified. The installer does not uninstall apps, randomize their identities, revoke certificates, reset Apple/Anisette state automatically, or copy health data. An existing app's data is not evidence of a successful migration; export a backup and retain the current copy until the new copy and permissions are checked.
 
-## How to use
+## Requirements and limits
 
-- Install usbmuxd for your platform
-  - Windows: [iTunes](https://apple.co/ms)
-  - macOS: Included
-  - Linux: Potentially included, if not, install via your package manager
-- Install the latest version for your platform from the [releases](https://github.com/nab138/iloader/releases)
-  - NixOS: Use the flake `github:nab138/iloader`
-  - Fedora: Use the .RPM or the unofficial [Fedora COPR repository](https://copr.fedorainfracloud.org/coprs/anudeepd/iloader)
-  - Arch: Use the unofficial [AUR package](https://aur.archlinux.org/packages/iloader-bin),
-- Plug in your iDevice to your computer
-- Open the app
-- Sign into your Apple ID
-- Select your action (e.g. install SideStore)
+- Mac or Windows, iPhone iOS 17.4+, USB for initial preparation, an Apple account and its required 2FA.
+- A functioning OS credential vault. There is no plaintext storage fallback; installer state is separate from iloader's existing vault.
+- The free Apple signing period remains seven days. Remote AltServer requires a connected Wi-Fi network and LocalDevVPN. Native background refresh is scheduled by iOS, not guaranteed at 09:00.
+- Apple can reject sign-in. AltStore 2.3.3 includes fixes for the reported -80045/-80046/415 series, but no installer can guarantee every account or device will authenticate.
+- No new Developer ID or Windows signing certificate has been purchased. Unsigned preview packages may require an explicit OS opening confirmation. Global OS protection must not be disabled.
+- Existing certificate limits stop the workflow; they never silently revoke a certificate used by other apps.
 
-## Features
+The SideStore shortcut shared for the Nanashi website targets a specific SideStore installation. It is not reused as if it could refresh AltStore.
 
-- Install SideStore (or LiveContainer + SideStore), import certificate and place rppairing+lockdown pairing files automatically
-- Import any IPA
-- Intelligent error suggestions to help resolve common issues
-- Manage pairing files in apps like StikDebug, SideStore, Protokolle, etc
-- See and revoke development certificates & app ids
+## Build
 
-## Troubleshooting
+Node 24, Rust stable, the platform's Tauri build prerequisites, and Xcode Command Line Tools on macOS are required.
 
-- If you are unable to solve an issue on your own, copy the full error message and ask on the [idevice Discord server](https://discord.gg/EA6yVgydBz) or [open an issue](https://github.com/nab138/iloader/issues).
-- You can view app logs with the "View Logs." If nothing is showing up, change the log level to "Debug."
-- If those logs aren't helpful, logs with additional are stored in the following locations:
-  - Windows: `%APPDATA%\me.nabdev.iloader\logs`
-  - macOS: `~/Library/Application Support/me.nabdev.iloader/logs`
-  - Linux: `~/.local/share/me.nabdev.iloader/logs/`
-
-## Translating
-
-iloader needs localization! If you speak another language and notice iloader does not support it or has mistakes, please consider contributing.
-
-To update/edit an existing language, make a PR modifying `src/locales/<lang>.json`.
-
-To add a new language, add your language to `src/i18next.ts`, and in `src/locales` copy `en.json` to a new file titled `<langcode>.json` and update the strings.
-
-**i18next.ts:**
-
-```ts
-const languages = [
-  ["en", "English"],
-  ["es", "Español"],
-  // Your language here...
-] as const;
+```sh
+npm ci --ignore-scripts
+npm run build
+cargo test --manifest-path src-tauri/Cargo.toml --lib
+npm run tauri -- build
 ```
 
-You can also add your name to the translators section of the README.
+The app uses its own bundle ID, `com.rayanmakhlouf.nanashi.installer`. It does not use the upstream iloader update feed. Preview packages are built separately from the native Nanashi application. Do not commit signing material, pairing files, device logs or release binaries.
 
-Thank you for translating!
+## Provenance
 
-## Building from source
+- iloader code: MIT; preserve [LICENSE](LICENSE) and [LICENSE-BRANDING](LICENSE-BRANDING). This is not an official iloader, SideStore or AltStore release. Upstream documentation is retained in [UPSTREAM_README.md](UPSTREAM_README.md).
+- AltStore: downloaded unchanged from its official CDN and locally re-signed for the user's device. Its notices and license remain with that application. No third-party patched IPA is substituted.
+- Interface: reuses Nanashi's static adaptations of [Glass Card by @educalvolpz](https://21st.dev/@educalvolpz/components/glass-card) and [Glass Button by @jahed](https://21st.dev/@jahed/components/glass-button). These are adaptations, not unchanged upstream components. The retrieved registry metadata did not supply individual license terms; no MIT claim is made for those visual sources.
+- Nanashi icon and Harbor Blue tokens come from the existing Nanashi project. The native app remains an independent fork of [NOOP](https://github.com/ryanbr/noop), with its own license.
 
-1. Install [bun](https://bun.sh) (or [Node.js](https://nodejs.org)) and [Rust](https://www.rust-lang.org/tools/install)
-2. Clone the repository and `cd` into it
-3. Run `bun i` (or `npm i`)
-
-For development with hot reload: `bun tauri dev` (or `npm run tauri dev`)
-Make a production build: `bun tauri build` (or `npm run tauri build`)
-
-## Credits
-
-- Icon made by [Transistor](https://github.com/transistor-exe)
-- UI improved by [StephenDev0](https://github.com/StephenDev0)
-- [idevice](https://github.com/jkcoxson/idevice) by [jkcoxson](https://github.com/jkcoxson) for communicating with iOS devices
-- [isideload](https://github.com/nab138/isideload) for installing apps
-  - [idevice](https://github.com/jkcoxson/idevice) by [jkcoxson](https://github.com/jkcoxson) crate is used to communicate with the device
-  - [apple-codesign-quick](https://github.com/Dadoum/apple-codesign-quick) by [Dadoum](https://github.com/Dadoum) for codesigning and entitlements
-  - [Impactor](https://github.com/claration/Impactor) by [claration](https://github.com/claration) was used as a reference for cryptography operations (converting certs to p12, etc.).
-  - [Sideloader](https://github.com/Dadoum/Sideloader) by [Dadoum](https://github.com/Dadoum) was used as a reference for how apple private developer endpoints work
-- [idevice_pair](https://github.com/jkcoxson/idevice_pair) was used as a reference for pairing file management
-- App made with [tauri](https://tauri.app)
-
-## Translators
-
-Thank you to everyone who has contributed translations! See the [Translating](#translating) section if you would like to contribute as well.
-
-- [By3lish](https://github.com/by3lish): Azerbaijani (az)
-- [TNT-333](https://github.com/TNT-333): German (de)
-- [basketshoe](https://github.com/basketshoe): Italian (it)
-- [baocreata](https://github.com/baocreata): Vietnamese (vt)
-- [IamArayel](https://github.com/IamArayel): French (fr)
-- [kkula9999](https://github.com/kkula9999): Traditional & Simplified Chinese (zh_tw & zh_cn)
-- [sibwaze](https://github.com/sibwaze): Russian (ru)
-- [notmalicik](https://github.com/notmalicik): Română (ro)
-- [mirdukkkkk](https://github.com/mirdukkkkk): Improved Russian (ru)
-- [okinaau](https://github.com/okinaau): Arabic (ar)
-- [ChouChiu](https://github.com/ChouChiu): Cantonese (zh_hk) & Improved Chinese (zh_tw & zh_cn)
-- [marcinmajsc](https://github.com/marcinmajsc): Polish (pl)
-- [ern775](https://github.com/ern775): Turkish (tr)
-- [canpng](https://github.com/canpng): Improved Turkish (tr)
-- [jazoppix](https://github.com/jazoppix): Spanish (es)
-- [eseiker](https://github.com/eseiker): Korean (ko)
-- [seomin0610](https://github.com/seomin0610): Improved Korean (ko)
-- [Ordyan777](https://github.com/Ordyan777): Armenian (am)
-- [kakik0u](https://github.com/kakik0u): Japanese (ja)
-- [lkspodmol](https://github.com/lkspodmol): Czech (cs_cz)
-- [marcusherelammonstyle-cmd](https://github.com/marcusherelammonstyle-cmd): Swedish (sv)
-- [MCI49312](https://github.com/MCI49312): Hungarian (hu)
-- [Kynonim](https://github.com/Kynonim): Indonesian (id)
-- [DD00031](https://github.com/DD00031): Dutch (nl)
-- [Toritan123](https://github.com/Toritan123): Improved Japanese (ja)
-- [marcinmajsc](https://github.com/marcinmajsc): Improved Polish (pl)
-- [dleiferives](https://github.com/dleiferives): Greek (el)
-- [ShadowWLX](https://github.com/ShadowWLX): Improved French (fr)
-- [fkpcomposer](https://github.com/fkpcomposer): Brazilian Portuguese (pt_br)
-- [474FrediFred](https://github.com/474FrediFred): Swiss German (de_ch)
-- [bovae](https://github.com/bovae) & [b1twalker](https://github.com/b1twalker): Ukranian (uk)
-
-## License
-
-Copyright (C) 2026 nab138
-
-The source code of this repository is licensed under the MIT License. See the [LICENSE](/LICENSE) file for the full text.
-
-Branding, logos, media assets, and the name “iloader” are not licensed under the MIT License and are subject to separate restrictions.
-
-You may retain or use branding materials in forks, tutorials, or documentation if you include a clear link to either the official site (https://iloader.app) or the iloader source code repository (https://github.com/nab138/iloader) and do not imply official endorsement. See [LICENSE-BRANDING](/LICENSE-BRANDING) for full details.
-
-## Contributing
-
-Please read our [Contributing](/CONTRIBUTING.md) policy before making a contribution.
-
-## Future Plans
-
-iloader is currently being overhauled, see the [trello board](https://trello.com/b/hAe1LHTj/iloader) for more info!
+No analytics, advertising SDK, credential upload to a Nanashi server, or health-data collection is included. Apple services and the configured Anisette provider are network dependencies of signing. Credentials must never be included in logs, screenshots or support exports.

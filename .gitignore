@@ -27,3 +27,10 @@ keys
 *.mobileprovision
 
 dockerfile
+# Local verification and release artifacts
+/build/
+/playwright-report/
+/test-results/
+*.p12
+*.pem
+*.key
