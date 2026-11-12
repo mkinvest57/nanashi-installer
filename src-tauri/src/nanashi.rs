@@ -431,7 +431,7 @@ pub async fn install_nanashi_manager_operation(
                         None,
                     )
                     .await
-                    .map_err(crate::account::safe_auth_error)
+                    .map_err(crate::error::safe_installation_error)
             },
             uncertain_installation(),
         )

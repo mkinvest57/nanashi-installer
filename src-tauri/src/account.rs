@@ -46,6 +46,10 @@ const ANISETTE_STATE_PRESERVED: &str = "L’état de connexion enregistré est i
 static ACTIVE_LOGIN: Mutex<Option<CancellationToken>> = Mutex::new(None);
 
 #[derive(Debug, thiserror::Error)]
+#[error("{CERTIFICATES_PRESERVED}")]
+pub(crate) struct CertificatesPreserved;
+
+#[derive(Debug, thiserror::Error)]
 #[error(
     "Le service de connexion demande une réinitialisation. Nanashi Installer s’arrête et conserve l’état existant."
 )]
@@ -322,6 +326,12 @@ async fn wait_for_two_factor_response(
 pub(crate) fn safe_auth_error(report: rootcause::Report) -> AppError {
     for cause in report.iter_reports() {
         if cause
+            .downcast_current_context::<CertificatesPreserved>()
+            .is_some()
+        {
+            return AppError::Developer(CERTIFICATES_PRESERVED.into());
+        }
+        if cause
             .downcast_current_context::<AnisetteResetBlocked>()
             .is_some()
         {
@@ -347,7 +357,7 @@ pub(crate) fn safe_auth_error(report: rootcause::Report) -> AppError {
 }
 
 fn blocked_certificate_selection() -> Result<Option<Vec<String>>, rootcause::Report> {
-    Err(std::io::Error::other(CERTIFICATES_PRESERVED))
+    Err(CertificatesPreserved)
         .context("Existing development certificates are preserved")
         .map_err(Into::into)
 }
@@ -752,6 +762,21 @@ mod tests {
     fn certificate_limit_never_selects_certificates_to_revoke() {
         let error = blocked_certificate_selection().unwrap_err();
         assert!(format!("{error:?}").contains("conservés"));
+    }
+
+    #[test]
+    fn certificate_limit_keeps_its_safe_cause_through_sdk_contexts() {
+        let report = blocked_certificate_selection()
+            .context("Failed to retrieve certificate identity")
+            .context("private-provider-response")
+            .unwrap_err();
+        assert!(report.iter_reports().any(|cause| cause
+            .downcast_current_context::<CertificatesPreserved>()
+            .is_some()));
+        let error = safe_auth_error(report.into());
+        assert!(matches!(error, AppError::Developer(_)));
+        assert_eq!(error.to_string(), CERTIFICATES_PRESERVED);
+        assert!(!error.to_string().contains("private-provider-response"));
     }
 
     #[test]

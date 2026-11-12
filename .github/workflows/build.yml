@@ -44,6 +44,8 @@ jobs:
             ~/.cargo/git
             src-tauri/target
           key: ${{ matrix.platform }}-nanashi-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.platform }}-nanashi-
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
       - name: Install Windows compiler dependencies

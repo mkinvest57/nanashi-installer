@@ -44,7 +44,7 @@ async function fixture(scenario = "success", viewport = { width: 980, height: 76
         }
         if (command === "login_new") {
           if (scenario === "auth-error") throw { type: "auth", message: "-80045 FAKE_SECRET_DO_NOT_DISPLAY apple-network-body" };
-          if (scenario === "certificate-limit") throw { type: "misc", message: "La limite de certificats Apple est atteinte. FAKE_SECRET_DO_NOT_DISPLAY" };
+          if (scenario === "certificate-limit") throw { type: "developer", message: "La limite de certificats Apple est atteinte. FAKE_SECRET_DO_NOT_DISPLAY" };
           if (scenario === "cancel-login") return new Promise((resolve, reject) => { resolveLogin = resolve; rejectLogin = reject; });
           return new Promise((resolve, reject) => { resolveLogin = resolve; rejectLogin = reject; setTimeout(() => notify("2fa-required", { requestId: scenario === "choose-method" ? "test-request-method" : "test-request-code", unknown: scenario === "choose-method", sms: false, numbers: scenario === "choose-method" ? [{ id: 42, label: "••••42" }] : [], selectedNumberId: null, hasError: false }), 0); });
         }
@@ -54,6 +54,17 @@ async function fixture(scenario = "success", viewport = { width: 980, height: 76
           for (const stepId of ["preflight", "download", "prepare", "install", "pairing"]) {
             notify("operation_install_nanashi_manager", { updateType: "started", stepId });
             await new Promise(resolve => setTimeout(resolve, 70));
+            const preparationErrors = {
+              "installation-quota": { type: "max_apps", message: "La limite d’apps de développement est atteinte. FAKE_SECRET_DO_NOT_DISPLAY" },
+              "installation-signature": { type: "installation_failed", message: "La signature d’AltStore a échoué. Code : INSTALL-SIGNATURE. FAKE_SECRET_DO_NOT_DISPLAY -80045" },
+              "installation-developer": { type: "developer", message: "Le service développeur Apple a refusé la signature (9412). FAKE_SECRET_DO_NOT_DISPLAY" },
+              "installation-unknown-marker": { type: "installation_failed", message: "Code : INSTALL-SIGNATURE-UNTRUSTED. FAKE_SECRET_DO_NOT_DISPLAY -80045" },
+            };
+            if (stepId === "prepare" && preparationErrors[scenario]) {
+              const error = preparationErrors[scenario];
+              notify("operation_install_nanashi_manager", { updateType: "failed", stepId, extraDetails: error });
+              throw error;
+            }
             if (scenario === "installation-uncertain" && stepId === "install") {
               const error = { type: "installation_uncertain", message: "Native installation timed out; device state unknown" };
               notify("operation_install_nanashi_manager", { updateType: "failed", stepId, extraDetails: error });
@@ -206,10 +217,30 @@ await run("post-install pairing failure remains incomplete", async () => {
   await expect(page.getByRole("img", { name: /QR code/ })).toHaveCount(0);
   await expect(page.locator("body")).not.toContainText("FAKE_SECRET_DO_NOT_DISPLAY"); await context.close();
 });
+for (const [scenario, diagnostic] of [
+  ["installation-quota", "La limite d’apps de développement est atteinte"],
+  ["installation-signature", "La signature d’AltStore a échoué (INSTALL-SIGNATURE)"],
+  ["installation-developer", "La signature Apple demande une vérification (9412)"],
+  ["installation-unknown-marker", "L’installation d’AltStore a échoué"],
+]) await run(`${scenario} remains an installation diagnostic without private report content`, async () => {
+  const { context, page, errors } = await fixture(scenario); await authenticate(page);
+  await page.getByRole("button", { name: "Préparer mon iPhone" }).click();
+  await expect(page.getByRole("alert")).toContainText(diagnostic);
+  await expect(page.getByRole("alert")).not.toContainText(/mot de passe|identifiants|connexion Apple|refusé la connexion|-80045|FAKE_SECRET_DO_NOT_DISPLAY/);
+  await expect(page.getByRole("img", { name: /QR code/ })).toHaveCount(0);
+  await expect(page.locator("body")).not.toContainText("FAKE_SECRET_DO_NOT_DISPLAY");
+  if (scenario === "installation-signature") await expect(page.getByRole("alert")).toContainText("avant le transfert sur l’iPhone");
+  if (scenario === "installation-unknown-marker") await expect(page.getByRole("alert")).not.toContainText("INSTALL-SIGNATURE");
+  const calls = await page.evaluate(() => window.__nanashiMock.calls);
+  expect(calls.filter(call => call.command === "install_nanashi_manager_operation")).toHaveLength(1);
+  expect(calls.filter(call => call.command === "login_new")).toHaveLength(1);
+  expect(calls.some(call => /revoke|delete_certificate/.test(call.command))).toBe(false);
+  expect(errors).toEqual([]); await context.close();
+});
 await run("uncertain installation requires a phone check before any manual retry", async () => {
   const { context, page } = await fixture("installation-uncertain"); await authenticate(page);
   await page.getByRole("button", { name: "Préparer mon iPhone" }).click();
-  await expect(page.getByRole("alert")).toContainText("Le Mac a cessé d’attendre ; l’iPhone peut encore terminer");
+  await expect(page.getByRole("alert")).toContainText("Le résultat de l’installation n’a pas pu être confirmé ; l’iPhone peut encore terminer");
   await expect(page.getByRole("button", { name: "Réessayer la préparation", exact: true })).toBeDisabled();
   await expect(page.getByRole("img", { name: /QR code/ })).toHaveCount(0);
   await page.getByRole("button", { name: "J’ai vérifié l’état sur l’iPhone", exact: true }).click();

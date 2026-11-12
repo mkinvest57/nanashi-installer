@@ -1,6 +1,6 @@
 [package]
 name = "nanashi-installer"
-version = "0.1.0"
+version = "0.1.1"
 description = "Independent Nanashi iPhone setup assistant"
 authors = ["nab138"]
 edition = "2024"

@@ -25,3 +25,13 @@ Use a backed-up device and the same Apple account as its current Nanashi install
 - https://github.com/altstoreio/FAQ/blob/main/altstore-classic/remote-altservers.md
 
 AltStore 2.3.3's actual IPA reads Documents/ALTPairingFile.plist, not the older ALTPairingFile.dat format emitted by isideload. It reads ALTDeviceID with uppercase ID. The installer supplies both required pieces through the supported installation/container path. It does not transfer an Apple password to the phone.
+
+## First physical trial
+
+The 0.1.0 preview opened on macOS and detected the USB-connected iPhone. Apple
+two-factor authentication completed, but the subsequent preparation failed.
+The old mapper had discarded the original installation error and incorrectly
+reported an authentication failure; certificate quota or device lock cannot
+be attributed to that attempt. The 0.1.1 diagnostics preserve safe typed causes
+and uncertainty without exposing provider bodies. Physical acceptance remains
+incomplete. The first preview was returned to draft pending this correction.
