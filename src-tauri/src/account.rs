@@ -761,7 +761,9 @@ mod tests {
     #[test]
     fn certificate_limit_never_selects_certificates_to_revoke() {
         let error = blocked_certificate_selection().unwrap_err();
-        assert!(format!("{error:?}").contains("conservés"));
+        assert!(error.iter_reports().any(|cause| cause
+            .downcast_current_context::<CertificatesPreserved>()
+            .is_some()));
     }
 
     #[test]
