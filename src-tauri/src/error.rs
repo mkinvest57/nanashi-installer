@@ -14,6 +14,8 @@ pub enum AppError {
     #[error("{0}")]
     DeviceComs(String),
     #[error("{0}")]
+    InstallationUncertain(String),
+    #[error("{0}")]
     Underage(String),
     #[error("{0}")]
     AccountLocked(String),

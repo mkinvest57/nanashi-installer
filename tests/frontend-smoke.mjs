@@ -54,6 +54,11 @@ async function fixture(scenario = "success", viewport = { width: 980, height: 76
           for (const stepId of ["preflight", "download", "prepare", "install", "pairing"]) {
             notify("operation_install_nanashi_manager", { updateType: "started", stepId });
             await new Promise(resolve => setTimeout(resolve, 70));
+            if (scenario === "installation-uncertain" && stepId === "install") {
+              const error = { type: "installation_uncertain", message: "Native installation timed out; device state unknown" };
+              notify("operation_install_nanashi_manager", { updateType: "failed", stepId, extraDetails: error });
+              throw error;
+            }
             if (scenario === "pairing-error" && stepId === "pairing") {
               const error = { type: "remote_pairing", message: "FAKE_SECRET_DO_NOT_DISPLAY" };
               notify("operation_install_nanashi_manager", { updateType: "failed", stepId, extraDetails: error });
@@ -200,6 +205,17 @@ await run("post-install pairing failure remains incomplete", async () => {
   await expect(page.getByText("AltStore est installé, mais sa préparation reste incomplète.", { exact: true })).toBeVisible();
   await expect(page.getByRole("img", { name: /QR code/ })).toHaveCount(0);
   await expect(page.locator("body")).not.toContainText("FAKE_SECRET_DO_NOT_DISPLAY"); await context.close();
+});
+await run("uncertain installation requires a phone check before any manual retry", async () => {
+  const { context, page } = await fixture("installation-uncertain"); await authenticate(page);
+  await page.getByRole("button", { name: "Préparer mon iPhone" }).click();
+  await expect(page.getByRole("alert")).toContainText("Le Mac a cessé d’attendre ; l’iPhone peut encore terminer");
+  await expect(page.getByRole("button", { name: "Réessayer la préparation", exact: true })).toBeDisabled();
+  await expect(page.getByRole("img", { name: /QR code/ })).toHaveCount(0);
+  await page.getByRole("button", { name: "J’ai vérifié l’état sur l’iPhone", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Réessayer la préparation", exact: true })).toBeEnabled();
+  expect(await page.evaluate(() => window.__nanashiMock.calls.filter(call => call.command === "install_nanashi_manager_operation").length)).toBe(1);
+  await context.close();
 });
 await run("unsupported iOS cannot start setup", async () => {
   const { context, page } = await fixture("old-ios");

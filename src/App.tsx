@@ -7,7 +7,7 @@ import { FiArrowLeft, FiArrowRight, FiCheck, FiCopy, FiExternalLink, FiLock, FiS
 import { AppleID } from "./AppleID";
 import type { DeviceInfo } from "./Device";
 import { isSupportedIOS, NanashiDevice } from "./components/NanashiDevice";
-import { NanashiButton, NanashiError, NanashiGlass } from "./components/NanashiGlass";
+import { isInstallationUncertain, NanashiButton, NanashiError, NanashiGlass } from "./components/NanashiGlass";
 import "./Nanashi.css";
 
 const HANDOFF_URL = "https://nanashi-mk.vercel.app/installation-nanashi?step=iphone#installation-etape";
@@ -41,6 +41,7 @@ function App() {
   const [currentStep, setCurrentStep] = useState<string | null>(null);
   const [completed, setCompleted] = useState<string[]>([]);
   const [operationError, setOperationError] = useState<unknown>(null);
+  const [requiresPhoneCheck, setRequiresPhoneCheck] = useState(false);
   const [result, setResult] = useState<ManagerResult | null>(null);
   const [linkStatus, setLinkStatus] = useState("");
   const busy = deviceBusy || authBusy || installing;
@@ -89,7 +90,7 @@ function App() {
     catch { setLinkStatus("Sélectionnez le lien ci-dessous pour le copier."); }
   }
   async function preparePhone() {
-    if (installLock.current || busy || !compatibleDevice || !loggedInAs || !keyring) return;
+    if (installLock.current || busy || requiresPhoneCheck || !compatibleDevice || !loggedInAs || !keyring) return;
     installLock.current = true;
     setInstalling(true); setOperationError(null); setResult(null); setCompleted([]); setCurrentStep(null);
     try {
@@ -99,7 +100,7 @@ function App() {
         if (!OPERATION_STEPS.some(step => step.id === update.stepId)) return;
         if (update.updateType === "started") setCurrentStep(update.stepId);
         if (update.updateType === "finished") setCompleted(previous => [...new Set([...previous, update.stepId])]);
-        if (update.updateType === "failed") { setCurrentStep(update.stepId); setOperationError(update.extraDetails ?? { type: "misc" }); }
+        if (update.updateType === "failed") { setCurrentStep(update.stepId); setOperationError(update.extraDetails ?? { type: "misc" }); if (isInstallationUncertain(update.extraDetails)) setRequiresPhoneCheck(true); }
       });
       unlistenRef.current = unlisten;
       const outcome = await invoke<ManagerResult>("install_nanashi_manager_operation");
@@ -107,7 +108,7 @@ function App() {
       if (outcome.manager !== "AltStore Classic" || outcome.pairingPlaced !== true || outcome.nanashiInstalled !== false || outcome.nextStep !== "finish_on_iphone") throw { type: "misc", message: "Unverified preparation result" };
       setResult(outcome); setCompleted(OPERATION_STEPS.map(step => step.id)); setCurrentStep(null);
       focusOnStep.current = true; setStage(3);
-    } catch (failure) { if (mounted.current) setOperationError(failure); }
+    } catch (failure) { if (mounted.current) { setOperationError(failure); if (isInstallationUncertain(failure)) setRequiresPhoneCheck(true); } }
     finally {
       unlistenRef.current?.(); unlistenRef.current = null; installLock.current = false;
       if (mounted.current) setInstalling(false);
@@ -124,7 +125,7 @@ function App() {
         <div className="ni-stage-meta"><span>ÉTAPE {stage + 1} / 4</span><span>{stage === 3 ? "SUR L’IPHONE" : "SUR L’ORDINATEUR"}</span></div>
         <h2 ref={heading} id="ni-stage-title" tabIndex={-1}>{STAGES[stage]}</h2>
 
-        {stage === 0 && <><p className="ni-description">Branchez l’iPhone en USB et déverrouillez-le. Sélectionnez-le ci-dessous lorsqu’il apparaît.{configuration && <> Cette préparation avec AltStore nécessite iOS {configuration.minimumIos} ou plus récent.</>}</p>{configurationError !== null && <><NanashiError error={configurationError} /><button type="button" className="ni-text-button" onClick={() => void loadConfiguration()}>Recharger la configuration</button></>}<NanashiDevice selectedDevice={selectedDevice} onSelect={setSelectedDevice} onBusyChange={setDeviceBusy} minimumIos={configuration?.minimumIos} /><details className="ni-help"><summary>L’iPhone n’apparaît pas ?</summary><p>Acceptez « Faire confiance à cet ordinateur » sur l’iPhone. Essayez un autre port USB ou un câble qui transporte les données. Sur Windows, les composants Apple doivent être installés.</p></details><div className="ni-actions"><NanashiButton primary type="button" disabled={!compatibleDevice || busy} onClick={() => navigate(1)}>Continuer<FiArrowRight aria-hidden="true" /></NanashiButton></div></>}
+        {stage === 0 && <><p className="ni-description">Branchez l’iPhone en USB et déverrouillez-le. Sélectionnez-le ci-dessous lorsqu’il apparaît.{configuration && <> Cette préparation avec AltStore nécessite iOS {configuration.minimumIos} ou plus récent.</>}</p>{configurationError !== null && <><NanashiError error={configurationError} /><button type="button" className="ni-text-button" onClick={() => void loadConfiguration()}>Recharger la configuration</button></>}<NanashiDevice selectedDevice={selectedDevice} onSelect={setSelectedDevice} onBusyChange={setDeviceBusy} minimumIos={configuration?.minimumIos} /><details className="ni-help"><summary>L’iPhone n’apparaît pas ?</summary><p>Acceptez « Faire confiance à cet ordinateur » sur l’iPhone. Essayez un autre port USB ou un câble qui transporte les données. Sur Windows, installez <a href="https://apps.microsoft.com/detail/9np83lwlpz9k" onClick={event => { event.preventDefault(); void openExternal("https://apps.microsoft.com/detail/9np83lwlpz9k"); }}>Appareils Apple</a>, puis relancez la détection.</p></details><div className="ni-actions"><NanashiButton primary type="button" disabled={!compatibleDevice || busy} onClick={() => navigate(1)}>Continuer<FiArrowRight aria-hidden="true" /></NanashiButton></div></>}
 
         {stage === 1 && <><p className="ni-description">Utilisez le même compte Apple que pour votre Nanashi actuelle. Il sert à signer l’app pour votre iPhone.</p>{keyring === null && <p role="status">Vérification du trousseau sécurisé…</p>}<AppleID loggedInAs={loggedInAs} setLoggedInAs={setLoggedInAs} noKeyringAvailable={keyring === false} disabled={keyring === null} onBusyChange={setAuthBusy} onCheckKeyring={() => void checkKeyring()} /><div className="ni-actions"><button className="ni-text-button" type="button" disabled={busy} onClick={() => navigate(0)}><FiArrowLeft aria-hidden="true" />Retour</button><NanashiButton primary type="button" disabled={!loggedInAs || busy || !keyring} onClick={() => navigate(2)}>Continuer<FiArrowRight aria-hidden="true" /></NanashiButton></div></>}
 
@@ -134,7 +135,8 @@ function App() {
           {(installing || completed.length > 0 || operationError !== null) && <ol className="ni-operation" aria-label="Progression de la préparation">{OPERATION_STEPS.map(step => <li key={step.id} className={completed.includes(step.id) ? "ni-done" : currentStep === step.id ? "ni-current" : ""}><span className="ni-operation-dot" aria-hidden="true">{completed.includes(step.id) ? <FiCheck /> : ""}</span><span>{step.label}</span>{currentStep === step.id && !completed.includes(step.id) && <small>{operationError ? "Interrompu" : "En cours"}</small>}</li>)}</ol>}
           {installing && <p className="ni-notice" role="status">Gardez l’iPhone branché et déverrouillé. Fermer cette fenêtre n’annule pas une installation déjà commencée.</p>}
           {operationError !== null && <>{completed.includes("install") && <div className="ni-notice"><strong>AltStore est installé, mais sa préparation reste incomplète.</strong><p>L’association à l’iPhone n’a pas été confirmée. Nanashi n’a pas été installée par cette opération.</p></div>}<NanashiError error={operationError} /></>}
-          <div className="ni-actions"><button className="ni-text-button" type="button" disabled={busy} onClick={() => navigate(1)}><FiArrowLeft aria-hidden="true" />Retour</button><NanashiButton primary type="button" disabled={busy || !selectedDevice || !loggedInAs || !keyring} onClick={() => void preparePhone()}>{installing ? "Préparation en cours…" : operationError ? "Réessayer la préparation" : "Préparer mon iPhone"}<FiArrowRight aria-hidden="true" /></NanashiButton></div>
+          {requiresPhoneCheck && <div className="ni-notice"><p>La vérification sur l’iPhone est nécessaire avant tout nouvel essai. Ce bouton confirme votre vérification ; il ne relance rien.</p><NanashiButton type="button" disabled={installing} onClick={() => setRequiresPhoneCheck(false)}>J’ai vérifié l’état sur l’iPhone</NanashiButton></div>}
+          <div className="ni-actions"><button className="ni-text-button" type="button" disabled={busy} onClick={() => navigate(1)}><FiArrowLeft aria-hidden="true" />Retour</button><NanashiButton primary type="button" disabled={busy || requiresPhoneCheck || !selectedDevice || !loggedInAs || !keyring} onClick={() => void preparePhone()}>{installing ? "Préparation en cours…" : operationError ? "Réessayer la préparation" : "Préparer mon iPhone"}<FiArrowRight aria-hidden="true" /></NanashiButton></div>
         </>}
 
         {stage === 3 && result && <><div className="ni-success"><FiCheck aria-hidden="true" /><div><strong>AltStore est prêt sur {result.deviceName}.</strong><p>L’association est en place. Il reste à autoriser AltStore et à installer Nanashi sur l’iPhone.</p></div></div>

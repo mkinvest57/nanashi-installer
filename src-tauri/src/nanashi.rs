@@ -35,6 +35,28 @@ const MANAGER_INFO_PATH: &str = "Payload/AltStore.app/Info.plist";
 const MANAGER_PAIRING_PATH: &str = "ALTPairingFile.plist";
 const NANASHI_IPA: &str =
     "https://github.com/mkinvest57/nanashi/releases/download/v12.1.1/Nanashi-ios-v12.1.1.ipa";
+const TEAM_TIMEOUT: Duration = Duration::from_secs(60);
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(8 * 60);
+const PAIRING_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn uncertain_installation() -> AppError {
+    AppError::InstallationUncertain(
+        "L’ordinateur a cessé d’attendre. L’iPhone peut encore terminer l’installation et son association n’est pas confirmée. Ne supprimez aucune app. Vérifiez AltStore sur l’iPhone avant de relancer la préparation. Aucun nouvel essai automatique n’est lancé.".into(),
+    )
+}
+
+async fn bounded_operation<T>(
+    duration: Duration,
+    operation: impl std::future::Future<Output = Result<T, AppError>>,
+    timeout_error: AppError,
+) -> Result<T, AppError> {
+    // The pinned SDK uses awaited futures for transfer/installation, not a
+    // detached task. Expiry drops local I/O before returning. iOS may already
+    // have accepted the install command: expiry never implies rollback.
+    tokio::time::timeout(duration, operation)
+        .await
+        .map_err(|_| timeout_error)?
+}
 
 static EXCLUSIVE_OPERATION: AtomicBool = AtomicBool::new(false);
 
@@ -341,11 +363,17 @@ pub async fn install_nanashi_manager_operation(
     let mut sideloader = op.fail_if_err("preflight", SideloaderGuard::take(&sideloader_state))?;
     let team = op.fail_if_err(
         "preflight",
-        sideloader
-            .get_mut()
-            .get_team()
-            .await
-            .map_err(crate::account::safe_auth_error),
+        bounded_operation(
+            TEAM_TIMEOUT,
+            async {
+                sideloader
+                    .get_mut()
+                    .get_team()
+                    .await
+                    .map_err(crate::account::safe_auth_error)
+            },
+            AppError::Developer("Apple n’a pas répondu à temps à la vérification du compte. L’installation n’a pas été lancée. Aucun nouvel essai automatique n’est lancé.".into()),
+        ).await,
     )?;
     let expected_bundle =
         op.fail_if_err("preflight", expected_manager_identifier(&team.team_id))?;
@@ -390,17 +418,24 @@ pub async fn install_nanashi_manager_operation(
     // Documents file below instead. No credentials are transferred to the phone.
     let installed = op.fail_if_err(
         "install",
-        sideloader
-            .get_mut()
-            .install_app(
-                &provider,
-                prepared,
-                true,
-                None::<fn(f32) -> std::future::Ready<()>>,
-                None,
-            )
-            .await
-            .map_err(crate::account::safe_auth_error),
+        bounded_operation(
+            INSTALL_TIMEOUT,
+            async {
+                sideloader
+                    .get_mut()
+                    .install_app(
+                        &provider,
+                        prepared,
+                        true,
+                        None::<fn(f32) -> std::future::Ready<()>>,
+                        None,
+                    )
+                    .await
+                    .map_err(crate::account::safe_auth_error)
+            },
+            uncertain_installation(),
+        )
+        .await,
     )?;
     if installed != Some(SpecialApp::AltStore) {
         return op.fail(
@@ -418,13 +453,19 @@ pub async fn install_nanashi_manager_operation(
             .map_err(|_| AppError::DeviceComs("AltStore a été installé, mais l’iPhone n’a pas confirmé son identité. Gardez l’iPhone déverrouillé, puis réessayez.".into()))?;
         let apps = proxy.get_apps(Some("User"), Some(vec![expected_bundle.clone()])).await
             .map_err(|_| AppError::DeviceComs("AltStore a été installé, mais sa présence sur l’iPhone n’a pas pu être vérifiée.".into()))?;
-        if !apps.iter().any(|(key, info)| is_expected_manager(key, info, &expected_bundle)) {
+        if !apps
+            .iter()
+            .any(|(key, info)| is_expected_manager(key, info, &expected_bundle))
+        {
             return Err(AppError::DeviceComs("L’iPhone n’a pas confirmé la version d’AltStore attendue pour votre compte. L’association n’a pas été transférée.".into()));
         }
         place_file(device.pairing.clone(), &provider, expected_bundle.clone(), MANAGER_PAIRING_PATH.into())
             .await.map_err(|_| AppError::DeviceComs("AltStore a été installé, mais l’association n’a pas pu être transférée. Gardez l’iPhone déverrouillé et réessayez. Ne supprimez pas vos apps.".into()))
-    }.await;
-    op.fail_if_err("pairing", pairing_result)?;
+    };
+    op.fail_if_err(
+        "pairing",
+        bounded_operation(PAIRING_TIMEOUT, pairing_result, uncertain_installation()).await,
+    )?;
     op.complete("pairing")?;
     Ok(BootstrapResult {
         manager: "AltStore Classic",
@@ -441,6 +482,54 @@ pub async fn install_nanashi_manager_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stalled_operation_is_dropped_before_returning_an_uncertain_result() {
+        use std::sync::{Arc, atomic::AtomicUsize};
+        struct DropSignal(Arc<AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let resource = DropSignal(dropped.clone());
+        let entered = attempts.clone();
+        let stalled = async move {
+            let _resource = resource;
+            entered.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<(), AppError>>().await
+        };
+        let result =
+            bounded_operation(Duration::from_millis(1), stalled, uncertain_installation()).await;
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        let error = result.unwrap_err();
+        assert!(matches!(error, AppError::InstallationUncertain(_)));
+        assert_eq!(
+            serde_json::to_value(error).unwrap()["type"],
+            "installation_uncertain"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_operation_preserves_success_and_explicit_failures() {
+        let success = bounded_operation(
+            Duration::from_secs(1),
+            async { Ok(75) },
+            uncertain_installation(),
+        )
+        .await;
+        assert_eq!(success.unwrap(), 75);
+        let failure = bounded_operation(
+            Duration::from_secs(1),
+            async { Err::<(), _>(AppError::MaxApps("limit".into())) },
+            uncertain_installation(),
+        )
+        .await;
+        assert!(matches!(failure, Err(AppError::MaxApps(_))));
+    }
 
     #[test]
     fn accepts_only_supported_numeric_ios_versions() {

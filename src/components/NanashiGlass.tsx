@@ -10,11 +10,18 @@ export function NanashiGlass({ className = "", ...props }: HTMLAttributes<HTMLDi
 export function NanashiButton({ className = "", primary = false, children, ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { primary?: boolean; children: ReactNode }) {
   return <button className={`ni-button ${primary ? "ni-primary" : ""} ${className}`} {...props}><span>{children}</span></button>;
 }
+export function isInstallationUncertain(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "type" in error && error.type === "installation_uncertain");
+}
 
 export function installationError(error: unknown): { title: string; message: string; code?: string } {
   const object = error && typeof error === "object" ? error as Record<string, unknown> : {};
   const message = typeof object.message === "string" ? object.message : typeof error === "string" ? error : "";
   const code = message.match(/-\d{4,6}\b/)?.[0];
+  if (isInstallationUncertain(error)) return {
+    title: "L’état de l’installation reste à vérifier",
+    message: "Le Mac a cessé d’attendre ; l’iPhone peut encore terminer. Gardez vos apps et vérifiez AltStore sur l’iPhone avant de relancer. Nanashi n’a pas été installée par cette opération.",
+  };
   if (message.includes("La limite de certificats Apple est atteinte")) return {
     title: "Limite de certificats Apple atteinte",
     message: "La préparation s’est arrêtée pour préserver vos autres apps. Aucun certificat ni profil existant n’a été révoqué. Conservez votre installation actuelle : cette limite doit être résolue avant de reprendre.",
