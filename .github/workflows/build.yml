@@ -17,17 +17,20 @@ jobs:
         include:
           - platform: macos-15-intel
             target: universal-apple-darwin
-            bundles: dmg
+            bundles: app
             artifact: nanashi-installer-macos
+            package: Nanashi-Installer-macOS.dmg
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: nsis
             artifact: nanashi-installer-windows
+            package: Nanashi-Installer-Windows.exe
     runs-on: ${{ matrix.platform }}
     env:
       CARGO_INCREMENTAL: 0
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
+      NANASHI_INSTALLER_VERSION: 0.1.2
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -37,7 +40,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.platform == 'macos-15-intel' && 'aarch64-apple-darwin,x86_64-apple-darwin' || 'x86_64-pc-windows-msvc' }}
-      - uses: actions/cache@v5
+      - uses: actions/cache/restore@v5
+        id: rust-cache
         with:
           path: |
             ~/.cargo/registry
@@ -56,10 +60,42 @@ jobs:
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
       - name: Build preview package
         run: npm run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
+      - name: Package universal macOS app without Finder
+        if: runner.os == 'macOS'
+        run: bash scripts/package-macos.sh "$NANASHI_INSTALLER_VERSION"
+      - name: Stage current Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $config = Get-Content -LiteralPath 'src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json
+          if ($config.version -ne $env:NANASHI_INSTALLER_VERSION) {
+            throw 'Installer version does not match the release version.'
+          }
+          $installer = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Nanashi Installer_$($env:NANASHI_INSTALLER_VERSION)_x64-setup.exe"
+          if (!(Test-Path -LiteralPath $installer -PathType Leaf) -or (Get-Item -LiteralPath $installer).Length -eq 0) {
+            throw 'The current Windows installer was not produced.'
+          }
+          New-Item -ItemType Directory -Force -Path 'release-artifacts' | Out-Null
+          Copy-Item -LiteralPath $installer -Destination 'release-artifacts/Nanashi-Installer-Windows.exe' -Force
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           if-no-files-found: error
+          path: release-artifacts/${{ matrix.package }}
+      - name: Preserve validated macOS app for packaging recovery
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          name: nanashi-installer-macos-app-recovery
+          if-no-files-found: ignore
+          path: build/ci-recovery/Nanashi-Installer-macOS-app.zip
+      - name: Save Rust compilation cache even if packaging fails
+        if: always() && steps.rust-cache.outputs.cache-primary-key != '' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
           path: |
-            src-tauri/target/**/release/bundle/**/*.dmg
-            src-tauri/target/**/release/bundle/**/*.exe
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}

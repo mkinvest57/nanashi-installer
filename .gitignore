@@ -34,3 +34,5 @@ dockerfile
 *.p12
 *.pem
 *.key
+
+/release-artifacts/
