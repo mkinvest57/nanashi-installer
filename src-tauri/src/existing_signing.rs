@@ -4,6 +4,8 @@
 //! and Anisette storage remain in Nanashi's separate keychain namespace.
 
 use std::{
+    io::Read,
+    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
@@ -570,6 +572,114 @@ fn ensure_same_proof(
     Ok(())
 }
 
+fn read_embedded_file(path: &Path) -> Result<Vec<u8>, AppError> {
+    const MAX_EMBEDDED_FILE: u64 = 1024 * 1024;
+    let invalid = || {
+        failure(
+            "UNVERIFIED",
+            "Les éléments de signature préparés pour AltStore sont illisibles.",
+        )
+    };
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| invalid())?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_EMBEDDED_FILE {
+        return Err(invalid());
+    }
+    let file = std::fs::File::open(path).map_err(|_| invalid())?;
+    let mut bytes = Vec::new();
+    file.take(MAX_EMBEDDED_FILE + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid())?;
+    if bytes.len() as u64 > MAX_EMBEDDED_FILE {
+        return Err(invalid());
+    }
+    Ok(bytes)
+}
+
+/// Check the identity AltStore will import before uploading the signed bundle.
+/// The engine's signature alone is insufficient: an unusable embedded identity
+/// could make AltStore fall back to requesting a different certificate later.
+pub(crate) fn verify_embedded_identity(
+    bundle: &Path,
+    proof: &ExistingSigningProof,
+) -> Result<(), AppError> {
+    let invalid = || {
+        failure(
+            "UNVERIFIED",
+            "L’identité de signature préparée pour AltStore n’a pas pu être vérifiée.",
+        )
+    };
+    let mismatch = || {
+        failure(
+            "CERTIFICATE-MISMATCH",
+            "L’identité intégrée à AltStore ne correspond pas à la signature existante sélectionnée.",
+        )
+    };
+    let directory = std::fs::symlink_metadata(bundle).map_err(|_| invalid())?;
+    if !directory.file_type().is_dir() {
+        return Err(invalid());
+    }
+    let info_bytes = read_embedded_file(&bundle.join("Info.plist"))?;
+    let info: plist::Dictionary = plist::from_bytes(&info_bytes).map_err(|_| invalid())?;
+    let serial = info
+        .get("ALTCertificateID")
+        .and_then(|v| v.as_string())
+        .ok_or_else(invalid)?;
+    if serial.is_empty()
+        || !serial
+            .bytes()
+            .all(|v| v.is_ascii_digit() || (b'A'..=b'F').contains(&v))
+    {
+        return Err(invalid());
+    }
+    let archive_bytes = Zeroizing::new(read_embedded_file(&bundle.join("ALTCertificate.p12"))?);
+    let archive = openssl::pkcs12::Pkcs12::from_der(&archive_bytes)
+        .map_err(|_| invalid())?
+        .parse2(&proof.machine_id)
+        .map_err(|_| invalid())?;
+    let certificate = archive.cert.ok_or_else(invalid)?;
+    let private_key = archive.pkey.ok_or_else(invalid)?;
+    let certificate_der = certificate.to_der().map_err(|_| invalid())?;
+    let digest: [u8; 32] = Sha256::digest(&certificate_der).into();
+    if digest != proof.certificate_sha256 {
+        return Err(mismatch());
+    }
+    let public_key = certificate.public_key().map_err(|_| invalid())?;
+    if !private_key.public_eq(&public_key) {
+        return Err(mismatch());
+    }
+    let parsed = Certificate::from_der(&certificate_der).map_err(|_| invalid())?;
+    if !certificate_team_matches(&parsed, &proof.team_id)
+        || parsed
+            .tbs_certificate
+            .subject_public_key_info
+            .subject_public_key
+            .as_bytes()
+            != Some(proof.public_key.as_slice())
+    {
+        return Err(mismatch());
+    }
+    let expected_serial = parsed
+        .tbs_certificate
+        .serial_number
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>();
+    if serial != expected_serial.trim_start_matches('0') {
+        return Err(mismatch());
+    }
+    let now = SystemTime::now();
+    if now < parsed.tbs_certificate.validity.not_before.to_system_time()
+        || now >= parsed.tbs_certificate.validity.not_after.to_system_time()
+    {
+        return Err(failure(
+            "CERTIFICATE-EXPIRED",
+            "Le certificat intégré à AltStore n’est plus valide à cette date.",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,5 +1065,159 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("CERTIFICATE-MISMATCH"));
+    }
+
+    fn embedded_identity_fixture(
+        serial: u32,
+    ) -> (
+        isideload::sideload::cert_identity::CertificateIdentity,
+        ExistingSigningProof,
+    ) {
+        use openssl::{
+            asn1::Asn1Time,
+            bn::BigNum,
+            hash::MessageDigest,
+            pkey::PKey,
+            x509::{X509, X509NameBuilder},
+        };
+        let private_der = PRIVATE.to_pkcs8_der().unwrap();
+        let key = PKey::private_key_from_der(private_der.as_bytes()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "Nanashi generated unit test")
+            .unwrap();
+        name.append_entry_by_text("OU", TEAM).unwrap();
+        let name = name.build();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_serial_number(&BigNum::from_u32(serial).unwrap().to_asn1_integer().unwrap())
+            .unwrap();
+        builder
+            .set_not_before(&Asn1Time::from_unix(now - 3600).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::from_unix(now + 3600).unwrap())
+            .unwrap();
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+        let certificate_der = builder.build().to_der().unwrap();
+        let certificate = Certificate::from_der(&certificate_der).unwrap();
+        let mut metadata = fixture(TEAM, &public_key());
+        metadata.cert_content = Some(certificate_der.into());
+        let proof =
+            choose_certificate(&[metadata], &public_key(), TEAM, SystemTime::now()).unwrap();
+        let identity = isideload::sideload::cert_identity::CertificateIdentity {
+            machine_id: proof.machine_id.clone(),
+            machine_name: proof.machine_name.clone(),
+            private_key: PRIVATE.clone(),
+            certificate,
+        };
+        (identity, proof)
+    }
+
+    async fn write_identity(
+        bundle: &Path,
+        identity: &isideload::sideload::cert_identity::CertificateIdentity,
+    ) {
+        let mut info = plist::Dictionary::new();
+        info.insert(
+            "ALTCertificateID".into(),
+            identity.get_serial_number().into(),
+        );
+        plist::to_file_xml(bundle.join("Info.plist"), &info).unwrap();
+        let p12 = identity.as_p12(&identity.machine_id).await.unwrap();
+        std::fs::write(bundle.join("ALTCertificate.p12"), p12).unwrap();
+    }
+
+    #[tokio::test]
+    async fn validates_real_sdk_embedded_pkcs12_and_rejects_wrong_password_certificate_or_key() {
+        let bundle = tempfile::tempdir().unwrap();
+        let (mut identity, proof) = embedded_identity_fixture(0x42);
+        write_identity(bundle.path(), &identity).await;
+        verify_embedded_identity(bundle.path(), &proof).unwrap();
+
+        let mut wrong_password = proof.clone();
+        wrong_password.machine_id = "incorrect-password".into();
+        has_code(
+            verify_embedded_identity(bundle.path(), &wrong_password),
+            "UNVERIFIED",
+        );
+
+        let mut wrong_key = proof.clone();
+        wrong_key.public_key = b"different-public-key".to_vec();
+        has_code(
+            verify_embedded_identity(bundle.path(), &wrong_key),
+            "CERTIFICATE-MISMATCH",
+        );
+
+        let (other_identity, _) = embedded_identity_fixture(0x43);
+        write_identity(bundle.path(), &other_identity).await;
+        has_code(
+            verify_embedded_identity(bundle.path(), &proof),
+            "CERTIFICATE-MISMATCH",
+        );
+
+        // Keep the pinned certificate but embed an unrelated private key.
+        // Some PKCS#12 readers reject this while parsing; others expose both
+        // objects. Neither path may allow upload as a usable AltStore identity.
+        identity.private_key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        write_identity(bundle.path(), &identity).await;
+        assert!(verify_embedded_identity(bundle.path(), &proof).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_tampered_embedded_serial_archive_and_oversized_files() {
+        let bundle = tempfile::tempdir().unwrap();
+        let (identity, proof) = embedded_identity_fixture(0x42);
+        write_identity(bundle.path(), &identity).await;
+        let mut info = plist::Dictionary::new();
+        info.insert("ALTCertificateID".into(), "43".into());
+        plist::to_file_xml(bundle.path().join("Info.plist"), &info).unwrap();
+        has_code(
+            verify_embedded_identity(bundle.path(), &proof),
+            "CERTIFICATE-MISMATCH",
+        );
+        write_identity(bundle.path(), &identity).await;
+        std::fs::write(bundle.path().join("ALTCertificate.p12"), b"corrupt archive").unwrap();
+        has_code(
+            verify_embedded_identity(bundle.path(), &proof),
+            "UNVERIFIED",
+        );
+        std::fs::write(
+            bundle.path().join("ALTCertificate.p12"),
+            vec![0; 1024 * 1024 + 1],
+        )
+        .unwrap();
+        has_code(
+            verify_embedded_identity(bundle.path(), &proof),
+            "UNVERIFIED",
+        );
+        std::fs::write(bundle.path().join("Info.plist"), vec![0; 1024 * 1024 + 1]).unwrap();
+        has_code(
+            verify_embedded_identity(bundle.path(), &proof),
+            "UNVERIFIED",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_symlinked_embedded_identity_files() {
+        let bundle = tempfile::tempdir().unwrap();
+        let (identity, proof) = embedded_identity_fixture(0x42);
+        write_identity(bundle.path(), &identity).await;
+        let original = bundle.path().join("ALTCertificate.p12");
+        let moved = bundle.path().join("other.p12");
+        std::fs::rename(&original, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &original).unwrap();
+        has_code(
+            verify_embedded_identity(bundle.path(), &proof),
+            "UNVERIFIED",
+        );
     }
 }

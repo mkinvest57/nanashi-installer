@@ -10,7 +10,7 @@ use std::{
 };
 
 use idevice::{IdeviceService, installation_proxy::InstallationProxyClient};
-use isideload::sideload::application::SpecialApp;
+use isideload::{dev::devices::DevicesApi, sideload::application::SpecialApp};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tauri::{State, Window};
@@ -459,17 +459,60 @@ pub async fn install_nanashi_manager_operation(
         bounded_operation(
             INSTALL_TIMEOUT,
             async {
-                sideloader
-                    .get_mut()
-                    .install_app(
-                        &provider,
-                        prepared_bundle,
-                        true,
-                        None::<fn(f32) -> std::future::Ready<()>>,
-                        None,
-                    )
-                    .await
-                    .map_err(crate::error::safe_installation_error)
+                if let Some(proof) = sideloader.existing_signing() {
+                    let info = isideload::util::device::IdeviceInfo::from_device(&provider)
+                        .await
+                        .map_err(crate::error::safe_installation_error)?;
+                    if info.udid != device.info.udid {
+                        return Err(AppError::DeviceComs(
+                            "L’iPhone connecté a changé. L’installation est arrêtée.".into(),
+                        ));
+                    }
+                    sideloader
+                        .get_mut()
+                        .get_dev_session()
+                        .ensure_device_registered(&team, &info.name, &info.udid, None)
+                        .await
+                        .map_err(crate::error::safe_installation_error)?;
+                    let (signed_path, special) = sideloader
+                        .get_mut()
+                        .sign_app(
+                            prepared_bundle,
+                            Some(team.clone()),
+                            true,
+                            None::<fn(f32) -> std::future::Ready<()>>,
+                            None,
+                            Some(&info.udid),
+                        )
+                        .await
+                        .map_err(crate::error::safe_installation_error)?;
+                    if special != Some(SpecialApp::AltStore) {
+                        return Err(AppError::InstallationFailed(
+                            "L’archive signée n’est pas AltStore. Code : INSTALL-ARCHIVE.".into(),
+                        ));
+                    }
+                    // Match AltStore's OpenSSL import before transferring the
+                    // package. A bad embedded identity must never invite its
+                    // certificate-replacement fallback on the phone.
+                    crate::existing_signing::verify_embedded_identity(&signed_path, &proof)?;
+                    ensure_same_device(&device_state, &device)?;
+                    isideload::sideload::install::install_app(&provider, &signed_path, |_| {})
+                        .await
+                        .map_err(crate::error::safe_installation_error)?;
+                    Ok(special)
+                } else {
+                    sideloader
+                        .get_mut()
+                        .install_app(
+                            &provider,
+                            prepared_bundle,
+                            true,
+                            None::<fn(f32) -> std::future::Ready<()>>,
+                            None,
+                        )
+                        .await
+                        .map_err(crate::error::safe_installation_error)
+                }
             },
             uncertain_installation(),
         )
