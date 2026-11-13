@@ -3,6 +3,7 @@ mod account;
 #[macro_use]
 mod device;
 mod error;
+mod existing_signing;
 mod nanashi;
 mod operation;
 mod pairing;
@@ -12,6 +13,7 @@ mod sideload;
 use crate::{
     account::{
         cancel_login, delete_account, invalidate_account, logged_in_as, login_new, login_stored,
+        signing_status,
     },
     device::{
         DeviceInfoMutex, PairingCancelToken, cancel_pairing, list_devices, set_selected_device,
@@ -43,6 +45,7 @@ pub fn run() {
             login_new,
             invalidate_account,
             logged_in_as,
+            signing_status,
             login_stored,
             delete_account,
             cancel_login,

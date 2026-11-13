@@ -9,11 +9,11 @@ use isideload::{
         app_ids::{AppIdsApi, ListAppIdsResponse},
         certificates::{CertificatesApi, DevelopmentCertificate},
         developer_session::DeveloperSession,
+        teams::TeamsApi,
     },
     sideload::{
         SideloaderBuilder,
         builder::{ExtensionsBehavior, ExtensionsBehaviorSelection, MaxCertsBehavior},
-        sideloader::Sideloader,
     },
     util::callbacks::{ExtensionsBehaviorCallbackBox, MaxCertsCallbackBox},
 };
@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     error::AppError,
     secure_storage::{KEYRING_SERVICE, create_sideloading_storage},
-    sideload::{SideloaderGuard, SideloaderMutex},
+    sideload::{AuthenticatedSideloader, SideloaderGuard, SideloaderMutex},
 };
 
 const ANISETTE_URL: &str = "https://mac-ani.jkcoxson.com";
@@ -324,6 +324,9 @@ async fn wait_for_two_factor_response(
 
 // Do not forward raw authentication responses, headers or server bodies to UI/logs.
 pub(crate) fn safe_auth_error(report: rootcause::Report) -> AppError {
+    if let Some(error) = crate::error::preserved_signature_error(&report) {
+        return error;
+    }
     for cause in report.iter_reports() {
         if cause
             .downcast_current_context::<CertificatesPreserved>()
@@ -371,9 +374,18 @@ pub async fn login_new(
     password: String,
     anisette_server: String,
     save_credentials: bool,
+    reuse_existing_signature: Option<bool>,
 ) -> Result<(), AppError> {
     let _operation = crate::nanashi::begin_exclusive_operation()?;
-    let account = login(&handle, window, &email, &password, anisette_server).await?;
+    let account = login(
+        &handle,
+        window,
+        &email,
+        &password,
+        anisette_server,
+        reuse_existing_signature.unwrap_or(false),
+    )
+    .await?;
 
     if save_credentials {
         let pass_entry = Entry::new(KEYRING_SERVICE, &email).map_err(|e| {
@@ -424,7 +436,7 @@ pub async fn login_stored(
     let password = pass_entry.get_password().map_err(|e| {
         AppError::KeyringWithMessage("Failed to get credentials".to_string(), e.to_string())
     })?;
-    let account = login(&handle, window, &email, &password, anisette_server).await?;
+    let account = login(&handle, window, &email, &password, anisette_server, false).await?;
     let mut sideloader_guard = sideloader_state.lock().unwrap();
     *sideloader_guard = Some(account);
 
@@ -462,7 +474,25 @@ pub fn logged_in_as(sideloader_state: State<'_, SideloaderMutex>) -> Option<Stri
     let sideloader_guard = sideloader_state.lock().unwrap();
     sideloader_guard
         .as_ref()
-        .map(|account| account.get_email().to_string())
+        .map(|account| account.engine.get_email().to_string())
+}
+
+#[derive(Serialize)]
+pub struct SigningStatus {
+    mode: &'static str,
+    verified: bool,
+}
+
+#[tauri::command]
+pub fn signing_status(sideloader_state: State<'_, SideloaderMutex>) -> SigningStatus {
+    let session = sideloader_state.lock().unwrap();
+    let verified = session
+        .as_ref()
+        .is_some_and(|account| account.existing_signing.is_some());
+    SigningStatus {
+        mode: if verified { "existing" } else { "standard" },
+        verified,
+    }
 }
 
 #[tauri::command]
@@ -479,7 +509,8 @@ async fn login(
     email: &str,
     password: &str,
     anisette_server: String,
-) -> Result<Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>, AppError> {
+    reuse_existing_signature: bool,
+) -> Result<AuthenticatedSideloader, AppError> {
     let anisette_url = validated_anisette_url(&anisette_server)?;
     // Fail closed before password authentication if secrets cannot be protected.
     let storage = create_sideloading_storage(app)?;
@@ -493,6 +524,7 @@ async fn login(
             anisette_url,
             storage,
             attempt.0.clone(),
+            reuse_existing_signature,
         ),
         attempt.0.clone(),
         LOGIN_TIMEOUT,
@@ -508,7 +540,8 @@ async fn login_inner(
     anisette_url: &str,
     storage: Box<dyn isideload::util::storage::SideloadingStorage>,
     cancellation: CancellationToken,
-) -> Result<Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>, AppError> {
+    reuse_existing_signature: bool,
+) -> Result<AuthenticatedSideloader, AppError> {
     // Upstream treats unreadable stored state as absent and has an unchecked
     // 16-byte conversion. Validate first, then load explicitly without replacing it.
     let state_data = storage.retrieve_data(
@@ -562,11 +595,23 @@ async fn login_inner(
                     user_agent: "akd/1.0 CFNetwork/811.5.4".to_string(),
                 })),
         ))
+        .build()
+        .await
+        .map_err(safe_auth_error)?;
+
+    let certificate_guard = if reuse_existing_signature {
+        Some(crate::existing_signing::install_certificate_guard(
+            &mut account,
+        )?)
+    } else {
+        None
+    };
+    account
         .login(password, Box::new(tfa_closure))
         .await
         .map_err(safe_auth_error)?;
 
-    let dev_session = DeveloperSession::from_account(&mut account)
+    let mut dev_session = DeveloperSession::from_account(&mut account)
         .await
         .map_err(safe_auth_error)?;
 
@@ -575,18 +620,69 @@ async fn login_inner(
             Box::pin(async move { blocked_certificate_selection() })
         });
 
-    // TODO: Team Selection
+    let existing = if reuse_existing_signature {
+        let teams = dev_session.list_teams().await.map_err(|_| {
+            AppError::ExistingSignature(
+                "Impossible de vérifier l’équipe Apple. Code : EXISTING-NETWORK.".into(),
+            )
+        })?;
+        // Reuse must never silently choose an organization instead of the
+        // personal team. Multiple teams need explicit selection in a future UI.
+        if teams.len() != 1 {
+            return Err(AppError::ExistingSignature(
+                "Une équipe Apple unique est nécessaire pour vérifier cette signature. Code : EXISTING-UNVERIFIED.".into()));
+        }
+        Some(
+            crate::existing_signing::resolve_existing_signing(&mut dev_session, email, &teams[0])
+                .await?,
+        )
+    } else {
+        None
+    };
+    if let (Some(guard), Some(existing)) = (&certificate_guard, &existing) {
+        guard.pin(&existing.proof)?;
+    }
+    let (machine_name, signing_storage, proof) = match existing {
+        Some(existing) => (
+            existing.machine_name,
+            existing.storage,
+            Some(existing.proof),
+        ),
+        None => (
+            "Nanashi Installer".into(),
+            create_sideloading_storage(app)?,
+            None,
+        ),
+    };
 
-    let sideloader = SideloaderBuilder::new(dev_session, email.to_lowercase())
-        .machine_name("Nanashi Installer".into())
-        .storage(create_sideloading_storage(app)?)
+    let mut sideloader = SideloaderBuilder::new(dev_session, email.to_lowercase())
+        .machine_name(machine_name)
+        .storage(signing_storage)
         .extensions_behavior(ExtensionsBehaviorSelection::Fixed(
             ExtensionsBehavior::RegisterAll,
         ))
         .max_certs_behavior(MaxCertsBehavior::Prompt(max_certs_callback))
         .build();
 
-    Ok(sideloader)
+    if let Some(proof) = &proof {
+        // Cache and verify the engine's selected team before exposing this
+        // session to any installation command.
+        let team = sideloader.get_team().await.map_err(|_| {
+            AppError::ExistingSignature(
+                "Impossible de vérifier l’équipe de signature. Code : EXISTING-NETWORK.".into(),
+            )
+        })?;
+        crate::existing_signing::revalidate_existing_signing(
+            sideloader.get_dev_session(),
+            &team,
+            proof,
+        )
+        .await?;
+    }
+    Ok(AuthenticatedSideloader {
+        engine: sideloader,
+        existing_signing: proof,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -761,9 +857,11 @@ mod tests {
     #[test]
     fn certificate_limit_never_selects_certificates_to_revoke() {
         let error = blocked_certificate_selection().unwrap_err();
-        assert!(error.iter_reports().any(|cause| cause
-            .downcast_current_context::<CertificatesPreserved>()
-            .is_some()));
+        assert!(error.iter_reports().any(|cause| {
+            cause
+                .downcast_current_context::<CertificatesPreserved>()
+                .is_some()
+        }));
     }
 
     #[test]
@@ -772,9 +870,11 @@ mod tests {
             .context("Failed to retrieve certificate identity")
             .context("private-provider-response")
             .unwrap_err();
-        assert!(report.iter_reports().any(|cause| cause
-            .downcast_current_context::<CertificatesPreserved>()
-            .is_some()));
+        assert!(report.iter_reports().any(|cause| {
+            cause
+                .downcast_current_context::<CertificatesPreserved>()
+                .is_some()
+        }));
         let error = safe_auth_error(report.into());
         assert!(matches!(error, AppError::Developer(_)));
         assert_eq!(error.to_string(), CERTIFICATES_PRESERVED);

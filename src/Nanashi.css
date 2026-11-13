@@ -79,6 +79,9 @@ h1, h2, h3 { font-weight: 590; line-height: 1.15; letter-spacing: -.035em; }
 .ni-login-form input, .ni-code-panel input { display: block; width: 100%; min-height: 50px; background: var(--ni-deep); border: 1px solid var(--ni-rim-bright); border-radius: var(--ni-xs); color: var(--ni-text); padding: var(--ni-s3) var(--ni-s4); font-size: .9375rem; }
 .ni-login-form input::placeholder { color: var(--ni-muted); }
 .ni-login-form > .ni-button { justify-self: start; }
+.ni-login-form .ni-checkbox-label { flex-direction: row; align-items: center; min-height: var(--ni-s12); gap: var(--ni-s3); cursor: pointer; }
+.ni-login-form .ni-checkbox-label input { width: var(--ni-s5); height: var(--ni-s5); min-height: var(--ni-s5); padding: 0; flex-shrink: 0; accent-color: var(--ni-accent); }
+.ni-signature-choice { border-block: 1px solid var(--ni-rim); padding-block: var(--ni-s2) var(--ni-s4); }
 .ni-caption { display: flex; align-items: flex-start; gap: var(--ni-s2); font-size: .6875rem; line-height: 1.8; color: var(--ni-muted); }
 .ni-caption svg { margin-top: 3px; }
 .ni-notice, .ni-error { padding: var(--ni-s4); border: 1px solid var(--ni-rim-bright); border-radius: var(--ni-sm); background: var(--ni-faint); font-size: .8125rem; line-height: 1.8; color: var(--ni-subtle); margin-block: var(--ni-s4); }

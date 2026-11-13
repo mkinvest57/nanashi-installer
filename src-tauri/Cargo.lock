@@ -3282,19 +3282,23 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "nanashi-installer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "http",
  "idevice",
  "isideload",
  "keyring",
  "once_cell",
  "plist",
  "plist-macro",
+ "rand 0.8.8",
  "reqwest",
+ "reqwest-middleware",
  "rootcause",
+ "rsa",
  "rustls",
  "serde",
  "serde_json",
@@ -3315,6 +3319,8 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "x509-cert 0.2.5",
+ "zeroize",
  "zip 8.6.0",
 ]
 

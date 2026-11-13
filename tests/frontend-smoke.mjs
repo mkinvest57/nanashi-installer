@@ -14,7 +14,7 @@ async function fixture(scenario = "success", viewport = { width: 980, height: 76
   await context.addInitScript(({ scenario }) => {
     window.isTauri = true;
     const callbacks = new Map(), listeners = new Map();
-    let id = 0, account = null, resolveLogin, rejectLogin;
+    let id = 0, account = null, resolveLogin, rejectLogin, reuseRequested = false;
     const calls = [];
     const device = { id: 1, udid: "TEST-DEVICE-NOT-REAL", name: "iPhone de démo", version: scenario === "old-ios" ? "16.7.10" : "18.5", connectionType: "USB" };
     function notify(event, payload) {
@@ -33,6 +33,10 @@ async function fixture(scenario = "success", viewport = { width: 980, height: 76
         if (command === "list_devices") return window.__nanashiMock.devices.map(device => ({ Ok: device }));
         if (command === "set_selected_device" || command === "cancel_pairing") return null;
         if (command === "logged_in_as") return account;
+        if (command === "signing_status") {
+          if (scenario === "reuse-status-error") throw { type: "existing_signature", message: "Code : EXISTING-UNVERIFIED. FAKE_SECRET_DO_NOT_DISPLAY" };
+          return { mode: reuseRequested && scenario !== "reuse-mode-mismatch" ? "existing" : "standard", verified: reuseRequested && scenario !== "reuse-unverified" };
+        }
         if (command === "invalidate_account") { account = null; return null; }
         if (command === "plugin:event|listen") { const listenerId = ++id; listeners.set(listenerId, args); return listenerId; }
         if (command === "plugin:event|unlisten") { listeners.delete(args.eventId); return null; }
@@ -43,6 +47,9 @@ async function fixture(scenario = "success", viewport = { width: 980, height: 76
           return null;
         }
         if (command === "login_new") {
+          reuseRequested = args.reuseExistingSignature === true;
+          const reuseErrorMarkers = { "reuse-missing-key": "EXISTING-KEY-MISSING", "reuse-certificate-mismatch": "EXISTING-CERTIFICATE-MISMATCH", "reuse-network": "EXISTING-NETWORK", "reuse-guard": "EXISTING-GUARD", "reuse-unknown-error": "EXISTING-KEY-MISSING-UNTRUSTED" };
+          if (reuseErrorMarkers[scenario]) throw { type: "existing_signature", message: `Code : ${reuseErrorMarkers[scenario]}. FAKE_SECRET_DO_NOT_DISPLAY` };
           if (scenario === "auth-error") throw { type: "auth", message: "-80045 FAKE_SECRET_DO_NOT_DISPLAY apple-network-body" };
           if (scenario === "certificate-limit") throw { type: "developer", message: "La limite de certificats Apple est atteinte. FAKE_SECRET_DO_NOT_DISPLAY" };
           if (scenario === "cancel-login") return new Promise((resolve, reject) => { resolveLogin = resolve; rejectLogin = reject; });
@@ -139,7 +146,7 @@ await run("explicit device selection, 2FA and verified manager-only completion",
   await expect(page.getByText(/Nanashi est installée/, { exact: false })).toHaveCount(0);
   const calls = await page.evaluate(() => window.__nanashiMock.calls);
   expect(calls.filter(call => call.command === "login_new")).toHaveLength(1);
-  expect(calls.find(call => call.command === "login_new").args).toMatchObject({ saveCredentials: false, anisetteServer: "https://mac-ani.jkcoxson.com" });
+  expect(calls.find(call => call.command === "login_new").args).toMatchObject({ saveCredentials: false, anisetteServer: "https://mac-ani.jkcoxson.com", reuseExistingSignature: false });
   expect(calls.filter(call => call.command === "install_nanashi_manager_operation")).toHaveLength(1);
   expect(calls.some(call => /revoke|delete_account|install_sidestore|sideload|check.*update/.test(call.command))).toBe(false);
   expect(await page.evaluate(() => [...window.__nanashiMock.listeners.values()].filter(listener => listener.event === "operation_install_nanashi_manager").length)).toBe(0);
@@ -209,6 +216,61 @@ await run("certificate exhaustion is explained without exposing a revocation con
   await expect(page.locator("body")).not.toContainText("FAKE_SECRET_DO_NOT_DISPLAY");
   expect(await page.evaluate(() => window.__nanashiMock.calls.some(call => /revoke|delete_certificate/.test(call.command)))).toBe(false);
   await context.close();
+});
+await run("existing signature reuse requires explicit opt-in and verified native status", async () => {
+  const { context, page, errors } = await fixture(); await selectPhone(page);
+  const reuse = page.getByRole("checkbox", { name: "Réutiliser ma signature iloader existante", exact: true });
+  await expect(reuse).not.toBeChecked();
+  await expect(page.getByText("Signature existante vérifiée", { exact: true })).toHaveCount(0);
+  await reuse.check(); await submitLogin(page);
+  await expect(reuse).toBeDisabled();
+  await expect(page.getByText("Signature existante vérifiée", { exact: true })).toHaveCount(0);
+  await page.getByLabel("Code de validation").fill("123456"); await page.getByRole("button", { name: "Valider le code" }).click();
+  await expect(page.getByText("Signature existante vérifiée", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Continuer", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "Continuer", exact: true }).click();
+  await page.getByRole("button", { name: "Retour", exact: true }).click();
+  await expect(page.getByText("Signature existante vérifiée", { exact: true })).toBeVisible();
+  const calls = await page.evaluate(() => window.__nanashiMock.calls);
+  expect(calls.find(call => call.command === "login_new").args).toMatchObject({ reuseExistingSignature: true, saveCredentials: false });
+  expect(calls.filter(call => call.command === "signing_status").length).toBeGreaterThanOrEqual(2);
+  expect(calls.some(call => /revoke|delete_certificate|install_nanashi_manager_operation/.test(call.command))).toBe(false);
+  await page.screenshot({ path: new URL("06-existing-signature.png", output).pathname, fullPage: true });
+  await page.getByRole("button", { name: "Modifier la connexion", exact: true }).click();
+  await expect(page.getByText("Signature existante vérifiée", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Continuer", exact: true })).toBeDisabled();
+  expect(errors).toEqual([]); await context.close();
+});
+for (const scenario of ["reuse-unverified", "reuse-mode-mismatch", "reuse-status-error"]) await run(`${scenario} cannot proceed as a verified existing signature`, async () => {
+  const { context, page, errors } = await fixture(scenario); await selectPhone(page);
+  await page.getByRole("checkbox", { name: "Réutiliser ma signature iloader existante", exact: true }).check();
+  await submitLogin(page);
+  await page.getByLabel("Code de validation").fill("123456"); await page.getByRole("button", { name: "Valider le code" }).click();
+  await expect(page.getByRole("alert")).toContainText("La réutilisation de la signature n’est pas confirmée");
+  await expect(page.getByText("Signature existante vérifiée", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Compte Apple connecté", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Continuer", exact: true })).toBeDisabled();
+  await expect(page.locator("body")).not.toContainText("FAKE_SECRET_DO_NOT_DISPLAY");
+  expect(await page.evaluate(() => window.__nanashiMock.calls.some(call => call.command === "install_nanashi_manager_operation"))).toBe(false);
+  expect(errors).toEqual([]); await context.close();
+});
+for (const [scenario, diagnostic] of [
+  ["reuse-missing-key", "La clé de signature iloader est introuvable"],
+  ["reuse-certificate-mismatch", "Aucun certificat ne correspond à cette clé"],
+  ["reuse-network", "La signature existante n’a pas pu être vérifiée"],
+  ["reuse-guard", "Une modification de certificat a été bloquée"],
+  ["reuse-unknown-error", "La signature existante n’a pas pu être réutilisée"],
+]) await run(`${scenario} explains recovery without raw native error content`, async () => {
+  const { context, page, errors } = await fixture(scenario); await selectPhone(page);
+  await page.getByRole("checkbox", { name: "Réutiliser ma signature iloader existante", exact: true }).check();
+  await submitLogin(page);
+  await expect(page.getByRole("alert")).toContainText(diagnostic);
+  await expect(page.locator("body")).not.toContainText("FAKE_SECRET_DO_NOT_DISPLAY");
+  await expect(page.getByRole("button", { name: "Continuer", exact: true })).toBeDisabled();
+  await expect(page.getByRole("checkbox", { name: "Réutiliser ma signature iloader existante", exact: true })).toBeChecked();
+  expect(await page.evaluate(() => window.__nanashiMock.calls.filter(call => call.command === "login_new").length)).toBe(1);
+  expect(await page.evaluate(() => window.__nanashiMock.calls.some(call => /revoke|delete_certificate|install_nanashi_manager_operation/.test(call.command)))).toBe(false);
+  expect(errors).toEqual([]); await context.close();
 });
 await run("post-install pairing failure remains incomplete", async () => {
   const { context, page } = await fixture("pairing-error"); await authenticate(page);

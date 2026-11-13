@@ -3,7 +3,8 @@ use tauri::AppHandle;
 
 use crate::error::AppError;
 
-// Never share credentials, certificates or ADI state with the upstream installer.
+// Keep authentication and ADI state isolated. Explicit signature reuse reads
+// only iloader's account-specific signing key through existing_signing.rs.
 pub const KEYRING_SERVICE: &str = "nanashi-installer";
 
 #[tauri::command]
@@ -56,7 +57,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_does_not_reuse_upstream_credentials() {
+    fn authentication_namespace_is_separate_from_iloader() {
         assert_eq!(KEYRING_SERVICE, "nanashi-installer");
         assert_ne!(KEYRING_SERVICE, "iloader");
     }

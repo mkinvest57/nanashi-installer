@@ -23,6 +23,14 @@ Nanashi itself is signed by AltStore, not by the bootstrap engine: the existing 
 - No new Developer ID or Windows signing certificate has been purchased. Unsigned preview packages may require an explicit OS opening confirmation. Global OS protection must not be disabled.
 - Existing certificate limits stop the workflow; they never silently revoke a certificate used by other apps.
 
+### Reusing an existing iloader signing identity
+
+Version 0.1.2 adds an explicit **Réutiliser ma signature iloader existante** option before Apple sign-in. It reads only the account-specific signing-key entry from iloader's OS credential vault. Passwords, saved sessions and Anisette state stay separate. The original vault entry is never changed or copied into Nanashi's vault.
+
+The reuse session verifies the key against a valid certificate returned by the authenticated Apple team, including the public key, team, validity and certificate identity. Missing keys, ambiguous teams/certificates and changed or expired identities stop preparation. Certificate creation and revocation requests are blocked at the HTTP boundary, including SDK fallback paths. This mode does not remove Apple account limits or guarantee that Apple will accept authentication.
+
+The encrypted identity is embedded in the official AltStore package so that the selected iPhone can use that same certificate for signing. No existing app is uninstalled. Installing on a second phone does not migrate the first phone's Nanashi history; any history migration requires a separate verified backup and restore.
+
 The SideStore shortcut shared for the Nanashi website targets a specific SideStore installation. It is not reused as if it could refresh AltStore.
 
 ## Build

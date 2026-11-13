@@ -25,6 +25,17 @@ const installationDiagnostics: Record<string, { title: string; message: string }
   "INSTALL-DEVELOPER-MODE": { title: "Le Mode développeur est nécessaire", message: "Sur l’iPhone, ouvrez Réglages → Confidentialité et sécurité → Mode développeur. Activez-le, puis redémarrez et confirmez si demandé." },
 };
 
+const existingSignatureDiagnostics: Record<string, { title: string; message: string }> = {
+  "EXISTING-KEY-MISSING": { title: "La clé de signature iloader est introuvable", message: "Utilisez l’ordinateur et le compte Apple qui ont servi à votre installation iloader. Le certificat seul ne suffit pas. Vos apps et leurs certificats restent inchangés." },
+  "EXISTING-KEY-INVALID": { title: "La clé de signature ne peut pas être utilisée", message: "La clé enregistrée n’a pas pu être validée. Conservez votre installation actuelle et reprenez depuis l’ordinateur utilisé avec iloader. Aucun certificat n’a été créé ni révoqué." },
+  "EXISTING-CERTIFICATE-MISMATCH": { title: "Aucun certificat ne correspond à cette clé", message: "Vérifiez que vous utilisez le même compte Apple et le même ordinateur que pour iloader. La préparation s’arrête pour conserver vos signatures existantes." },
+  "EXISTING-CERTIFICATE-EXPIRED": { title: "La signature existante a expiré", message: "Cette signature ne permet plus de préparer l’iPhone. Conservez vos apps actuelles ; aucun autre certificat n’a été créé ni révoqué." },
+  "EXISTING-CERTIFICATE-AMBIGUOUS": { title: "La signature ne peut pas être choisie avec certitude", message: "Plusieurs certificats correspondent à la clé enregistrée. La préparation s’arrête sans choisir ni modifier un certificat au hasard." },
+  "EXISTING-NETWORK": { title: "La signature existante n’a pas pu être vérifiée", message: "Vérifiez la connexion Internet de cet ordinateur, puis relancez la connexion Apple. La signature doit être vérifiée avant toute installation." },
+  "EXISTING-GUARD": { title: "Une modification de certificat a été bloquée", message: "Cette préparation autorise uniquement la réutilisation de votre signature. Une demande de création ou de révocation a donc été arrêtée. Vos certificats sont conservés." },
+  "EXISTING-UNVERIFIED": { title: "La réutilisation de la signature n’est pas confirmée", message: "Reconnectez-vous en conservant l’option de réutilisation. La préparation restera bloquée tant que la signature existante n’aura pas été vérifiée." },
+};
+
 export function installationError(error: unknown): { title: string; message: string; code?: string } {
   const object = error && typeof error === "object" ? error as Record<string, unknown> : {};
   const message = typeof object.message === "string" ? object.message : typeof error === "string" ? error : "";
@@ -34,6 +45,14 @@ export function installationError(error: unknown): { title: string; message: str
     title: "L’état de l’installation reste à vérifier",
     message: "Le résultat de l’installation n’a pas pu être confirmé ; l’iPhone peut encore terminer. Gardez vos apps et vérifiez AltStore sur l’iPhone avant de relancer. Nanashi n’a pas été installée par cette opération.",
   };
+  if (object.type === "existing_signature") {
+    const marker = message.match(/\bCode\s*:\s*(EXISTING-[A-Z-]+)\b/)?.[1];
+    const detail = marker ? existingSignatureDiagnostics[marker] : undefined;
+    return detail ? { ...detail, code: marker } : {
+      title: "La signature existante n’a pas pu être réutilisée",
+      message: "La préparation s’arrête pour préserver vos apps. Vérifiez le compte Apple et l’ordinateur utilisés avec iloader. Aucun certificat n’a été créé ni révoqué.",
+    };
+  }
   if (object.type === "installation_failed") {
     const marker = message.match(/\bCode\s*:\s*(INSTALL-[A-Z-]+)\b/)?.[1];
     const detail = marker ? installationDiagnostics[marker] : undefined;

@@ -299,6 +299,28 @@ fn selected_device(state: &DeviceInfoMutex) -> Result<DeviceInfoWithPairing, App
         .ok_or(AppError::NoDeviceSelected)
 }
 
+fn extract_manager_for_signing(source: &Path, destination: &Path) -> Result<PathBuf, AppError> {
+    let fail = || {
+        AppError::InstallationFailed(
+            "Impossible de préparer le dossier privé de signature. Code : INSTALL-ARCHIVE.".into(),
+        )
+    };
+    let mut archive =
+        ZipArchive::new(File::open(source).map_err(|_| fail())?).map_err(|_| fail())?;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|_| fail())?;
+        if entry.enclosed_name().is_none() || entry.is_symlink() {
+            return Err(fail());
+        }
+    }
+    archive.extract(destination).map_err(|_| fail())?;
+    let bundle = destination.join("Payload/AltStore.app");
+    if !bundle.join("Info.plist").is_file() {
+        return Err(fail());
+    }
+    Ok(bundle)
+}
+
 fn ensure_same_device(
     state: &DeviceInfoMutex,
     expected: &DeviceInfoWithPairing,
@@ -377,6 +399,14 @@ pub async fn install_nanashi_manager_operation(
     )?;
     let expected_bundle =
         op.fail_if_err("preflight", expected_manager_identifier(&team.team_id))?;
+    if let Some(proof) = sideloader.existing_signing() {
+        op.fail_if_err("preflight", bounded_operation(
+            TEAM_TIMEOUT,
+            crate::existing_signing::revalidate_existing_signing(
+                sideloader.get_mut().get_dev_session(), &team, &proof),
+            AppError::ExistingSignature("La vérification du certificat a dépassé le délai. Aucun certificat n’a été modifié. Code : EXISTING-NETWORK.".into()),
+        ).await)?;
+    }
     op.fail_if_err("preflight", get_provider(&device.info).await)?;
     let temp = op.fail_if_err(
         "preflight",
@@ -396,17 +426,24 @@ pub async fn install_nanashi_manager_operation(
     op.fail_if_err("download", download_manager(&downloaded).await)?;
     op.move_on("download", "prepare")?;
     let target = prepared.clone();
+    let signing_directory = temp.path().join("signing");
     let udid = device.info.udid.clone();
-    op.fail_if_err(
+    let prepared_bundle = op.fail_if_err(
         "prepare",
-        tokio::task::spawn_blocking(move || prepare_manager(downloaded, target, udid))
-            .await
-            .map_err(|_| {
-                AppError::Misc(
-                    "La préparation d’AltStore a été interrompue. Rien n’a été installé.".into(),
-                )
-            })
-            .and_then(|result| result),
+        tokio::task::spawn_blocking(move || {
+            prepare_manager(downloaded, target.clone(), udid)?;
+            // Passing a directory avoids the SDK's shared *_extracted path.
+            // The parent TempDir also removes encrypted signing material on
+            // failure or cancellation, not just after successful installation.
+            extract_manager_for_signing(&target, &signing_directory)
+        })
+        .await
+        .map_err(|_| {
+            AppError::Misc(
+                "La préparation d’AltStore a été interrompue. Rien n’a été installé.".into(),
+            )
+        })
+        .and_then(|result| result),
     )?;
     op.fail_if_err("prepare", ensure_same_device(&device_state, &device))?;
     // Resolve this UDID again after downloading; never reuse a USB device slot
@@ -415,7 +452,8 @@ pub async fn install_nanashi_manager_operation(
     op.move_on("prepare", "install")?;
     // The pinned engine embeds the existing signing certificate. Its legacy
     // encrypted pairing format is not used by this release; place the supported
-    // Documents file below instead. No credentials are transferred to the phone.
+    // Documents file below instead. The encrypted signing identity is embedded
+    // for AltStore; the Apple account password is never transferred to the phone.
     let installed = op.fail_if_err(
         "install",
         bounded_operation(
@@ -425,7 +463,7 @@ pub async fn install_nanashi_manager_operation(
                     .get_mut()
                     .install_app(
                         &provider,
-                        prepared,
+                        prepared_bundle,
                         true,
                         None::<fn(f32) -> std::future::Ready<()>>,
                         None,
@@ -686,6 +724,38 @@ mod tests {
         *state.lock().unwrap() = Some(snapshot.clone());
         state.lock().unwrap().as_mut().unwrap().pairing = vec![4, 5, 6];
         assert!(ensure_same_device(&state, &snapshot).is_err());
+    }
+
+    #[test]
+    fn signing_bundle_stays_in_owned_temporary_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive_path = temp.path().join("prepared.ipa");
+        let mut writer = ZipWriter::new(File::create(&archive_path).unwrap());
+        writer
+            .start_file(MANAGER_INFO_PATH, SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"test fixture").unwrap();
+        writer.finish().unwrap();
+        let bundle =
+            extract_manager_for_signing(&archive_path, &temp.path().join("private")).unwrap();
+        assert!(bundle.starts_with(temp.path()));
+        assert!(bundle.join("Info.plist").exists());
+        drop(temp);
+        assert!(!bundle.exists());
+    }
+
+    #[test]
+    fn signing_extraction_rejects_escape_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive_path = temp.path().join("invalid.ipa");
+        let mut writer = ZipWriter::new(File::create(&archive_path).unwrap());
+        writer
+            .start_file("../outside", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"must not escape").unwrap();
+        writer.finish().unwrap();
+        assert!(extract_manager_for_signing(&archive_path, &temp.path().join("private")).is_err());
+        assert!(!temp.path().join("outside").exists());
     }
 
     #[test]

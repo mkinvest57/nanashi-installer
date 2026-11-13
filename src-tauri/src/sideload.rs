@@ -12,12 +12,20 @@ use isideload::{
 };
 use tauri::{AppHandle, Manager, State, Window};
 
-pub type SideloaderMutex =
-    Mutex<Option<Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>>>;
+pub type SideloadEngine = Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>;
+
+// Keep the verified signing identity attached to the authenticated session, so
+// switching accounts can never retain another account's reuse authorization.
+pub struct AuthenticatedSideloader {
+    pub engine: SideloadEngine,
+    pub existing_signing: Option<crate::existing_signing::ExistingSigningProof>,
+}
+
+pub type SideloaderMutex = Mutex<Option<AuthenticatedSideloader>>;
 
 pub struct SideloaderGuard<'a> {
     state: &'a SideloaderMutex,
-    sideloader: Option<Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>>,
+    sideloader: Option<AuthenticatedSideloader>,
 }
 
 impl<'a> SideloaderGuard<'a> {
@@ -33,9 +41,15 @@ impl<'a> SideloaderGuard<'a> {
     pub fn get_mut(
         &mut self,
     ) -> &mut Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox> {
-        self.sideloader
+        &mut self
+            .sideloader
             .as_mut()
             .expect("Sideloader should be present")
+            .engine
+    }
+
+    pub fn existing_signing(&self) -> Option<crate::existing_signing::ExistingSigningProof> {
+        self.sideloader.as_ref()?.existing_signing.clone()
     }
 }
 

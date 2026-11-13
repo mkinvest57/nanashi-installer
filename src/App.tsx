@@ -15,7 +15,7 @@ const STAGES = ["Votre iPhone", "Compte Apple", "Préparation", "Sur l’iPhone"
 const OPERATION_STEPS = [
   { id: "preflight", label: "Vérification de l’iPhone et du compte" },
   { id: "download", label: "Téléchargement d’AltStore Classic" },
-  { id: "prepare", label: "Préparation de la signature" },
+  { id: "prepare", label: "Préparation de l’archive" },
   { id: "install", label: "Installation d’AltStore sur l’iPhone" },
   { id: "pairing", label: "Association à cet iPhone" },
 ] as const;

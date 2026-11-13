@@ -24,6 +24,8 @@ pub enum AppError {
     #[error("{0}")]
     Developer(String),
     #[error("{0}")]
+    ExistingSignature(String),
+    #[error("{0}")]
     Auth(String),
     #[error("{0}")]
     Download(String),
@@ -74,6 +76,9 @@ impl Serialize for AppError {
 // Signing/installation reports are not authentication failures. Preserve typed
 // causes and fixed SDK stage names without exposing request bodies or paths.
 pub(crate) fn safe_installation_error(report: Report) -> AppError {
+    if let Some(error) = preserved_signature_error(&report) {
+        return error;
+    }
     for cause in report.iter_reports() {
         if let Some(marker) =
             cause.downcast_current_context::<crate::account::CertificatesPreserved>()
@@ -130,6 +135,37 @@ pub(crate) fn safe_installation_error(report: Report) -> AppError {
         }
     }
     unknown_installation_result()
+}
+
+// Keep the explicit reuse-only boundary visible even when the SDK adds network
+// or certificate-lookup context around it. Never stringify a provider response.
+pub(crate) fn preserved_signature_error(report: &Report) -> Option<AppError> {
+    for cause in report.iter_reports() {
+        if cause
+            .downcast_current_context::<crate::existing_signing::CertificateMutationBlocked>()
+            .is_some()
+        {
+            return Some(AppError::ExistingSignature(
+                "L’opération s’est arrêtée pour conserver la signature existante. Code : EXISTING-GUARD.".into()));
+        }
+        if let Some(AppError::ExistingSignature(message)) =
+            cause.downcast_current_context::<AppError>()
+        {
+            return Some(AppError::ExistingSignature(message.clone()));
+        }
+        if let Some(reqwest_middleware::Error::Middleware(inner)) =
+            cause.downcast_current_context::<reqwest_middleware::Error>()
+        {
+            if inner.is::<crate::existing_signing::CertificateMutationBlocked>() {
+                return Some(AppError::ExistingSignature(
+                    "L’opération s’est arrêtée pour conserver la signature existante. Code : EXISTING-GUARD.".into()));
+            }
+            if let Some(AppError::ExistingSignature(message)) = inner.downcast_ref::<AppError>() {
+                return Some(AppError::ExistingSignature(message.clone()));
+            }
+        }
+    }
+    None
 }
 
 fn unknown_installation_result() -> AppError {
@@ -227,6 +263,36 @@ mod tests {
                 .to_string()
                 .contains("La limite de certificats Apple est atteinte")
         );
+        assert!(!error.to_string().contains("private-request-context"));
+    }
+
+    #[test]
+    fn reuse_guard_remains_actionable_through_sdk_network_context() {
+        let make_report = || {
+            wrapped(reqwest_middleware::Error::middleware(
+                crate::existing_signing::CertificateMutationBlocked,
+            ))
+        };
+        for error in [
+            safe_installation_error(make_report()),
+            crate::account::safe_auth_error(make_report()),
+        ] {
+            assert!(matches!(error, AppError::ExistingSignature(_)));
+            assert!(error.to_string().contains("EXISTING-GUARD"));
+            assert!(!error.to_string().contains("private-request-context"));
+        }
+    }
+
+    #[test]
+    fn changed_certificate_keeps_its_specific_reuse_diagnostic() {
+        let report = wrapped(reqwest_middleware::Error::middleware(
+            AppError::ExistingSignature(
+                "La signature a changé. Code : EXISTING-CERTIFICATE-MISMATCH.".into(),
+            ),
+        ));
+        let error = safe_installation_error(report);
+        assert!(matches!(error, AppError::ExistingSignature(_)));
+        assert!(error.to_string().contains("EXISTING-CERTIFICATE-MISMATCH"));
         assert!(!error.to_string().contains("private-request-context"));
     }
 
