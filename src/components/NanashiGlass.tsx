@@ -36,11 +36,38 @@ const existingSignatureDiagnostics: Record<string, { title: string; message: str
   "EXISTING-UNVERIFIED": { title: "La réutilisation de la signature n’est pas confirmée", message: "Reconnectez-vous en conservant l’option de réutilisation. La préparation restera bloquée tant que la signature existante n’aura pas été vérifiée." },
 };
 
+const authDiagnostics: Record<string, { title: string; message: string }> = {
+  "AUTH-DISCOVERY": { title: "Les services Apple n’ont pas pu être préparés", message: "Vérifiez que cet ordinateur peut ouvrir account.apple.com. Vous pourrez relancer la connexion depuis ce formulaire." },
+  "AUTH-SIGN-IN": { title: "La connexion au compte Apple n’a pas abouti", message: "Consultez les demandes éventuelles sur votre appareil de confiance. Vous pouvez vérifier votre compte sur account.apple.com." },
+  "AUTH-2FA": { title: "La validation en deux étapes n’a pas abouti", message: "Gardez votre appareil de confiance à portée de main. Lors de votre prochaine connexion, utilisez le code de cette nouvelle demande." },
+  "AUTH-DEVELOPER-SESSION": { title: "La session de signature Apple n’a pas pu être ouverte", message: "La préparation s’est arrêtée lors de l’accès aux services développeur. Connectez-vous à developer.apple.com/account pour vérifier si Apple y demande une action." },
+  "AUTH-NETWORK": { title: "La connexion réseau a été interrompue", message: "Vérifiez l’accès à Internet depuis cet ordinateur avant de relancer la connexion." },
+  "AUTH-SERVICE": { title: "Le service de connexion est temporairement indisponible", message: "Réessayez plus tard. Une panne de ce service peut interrompre la connexion même si vos identifiants sont corrects." },
+  "AUTH-RATE-LIMIT": { title: "Le service demande d’espacer les tentatives", message: "Attendez avant de relancer la connexion. L’installateur reprendra uniquement à votre demande." },
+  "AUTH-TIMEOUT": { title: "Le délai de connexion est dépassé", message: "Vérifiez votre connexion Internet et les demandes affichées sur votre appareil Apple avant de recommencer." },
+  "AUTH-2FA-TIMEOUT": { title: "Le délai de validation du code est dépassé", message: "Relancez la connexion quand votre appareil de confiance est à portée de main. Saisissez le code à six chiffres de la nouvelle demande." },
+};
+
 export function installationError(error: unknown): { title: string; message: string; code?: string } {
   const object = error && typeof error === "object" ? error as Record<string, unknown> : {};
   const message = typeof object.message === "string" ? object.message : typeof error === "string" ? error : "";
   const appleError = ["auth", "developer", "account_locked", "underage"].includes(String(object.type));
-  const code = appleError ? message.match(/\((-?\d{1,10})\)/)?.[1] ?? message.match(/-\d{4,6}\b/)?.[0] : undefined;
+  const code = appleError
+    ? message.match(/^(?:Apple|Le service développeur Apple) a refusé [^().\n]{1,64} \((-?\d{1,10})\)/)?.[1] ?? message.match(/^(-\d{4,6})\b/)?.[1]
+    : undefined;
+  if (object.type === "auth" || object.type === "anisette") {
+    const marker = message.match(/\bCode\s*:\s*(AUTH-[A-Z0-9-]+)\b/)?.[1];
+    if (object.type === "anisette" && marker === "AUTH-PROVIDER") return {
+      title: "Le service de préparation de la connexion est indisponible",
+      message: "Vérifiez l’accès à Internet sur cet ordinateur. Si la connexion fonctionne, réessayez plus tard.",
+      code: marker,
+    };
+    if (object.type === "auth" && marker && authDiagnostics[marker]) {
+      const detail = authDiagnostics[marker];
+      const status = marker === "AUTH-SERVICE" && message.match(/\bHTTP (5\d{2})\. Code : AUTH-SERVICE\b/);
+      return { ...detail, title: status ? `${detail.title} (HTTP ${status[1]})` : detail.title, code: marker };
+    }
+  }
   if (isInstallationUncertain(error)) return {
     title: "L’état de l’installation reste à vérifier",
     message: "Le résultat de l’installation n’a pas pu être confirmé ; l’iPhone peut encore terminer. Gardez vos apps et vérifiez AltStore sur l’iPhone avant de relancer. Nanashi n’a pas été installée par cette opération.",
@@ -70,7 +97,9 @@ export function installationError(error: unknown): { title: string; message: str
   const messages: Record<string, { title: string; message: string }> = {
     keyring: { title: "Le trousseau est indisponible", message: "Déverrouillez le trousseau de cet ordinateur avant de vous connecter. Les identifiants ne seront pas enregistrés dans un fichier de secours." },
     keyring_with_message: { title: "Le trousseau est indisponible", message: "Déverrouillez le trousseau de cet ordinateur, puis vérifiez à nouveau sa disponibilité." },
-    auth: { title: "La connexion Apple n’a pas abouti", message: "Vérifiez vos identifiants et les demandes de validation Apple. Vous pouvez corriger les champs et relancer vous-même la connexion." },
+    auth: { title: "La connexion Apple n’a pas abouti", message: "L’installateur n’a pas reçu de motif plus précis. Consultez les demandes éventuelles sur votre appareil de confiance avant de réessayer." },
+    verification_unavailable: { title: "L’installateur ne peut pas recevoir la validation Apple", message: "Réactivez la réception des demandes de validation sur cet ordinateur pour pouvoir vous connecter." },
+    verification_delivery: { title: "La réponse de validation n’a pas été transmise", message: "La demande reste ouverte. Renvoyez votre choix ou votre code depuis ce formulaire." },
     account_locked: { title: "Le compte Apple demande votre attention", message: "Terminez la vérification du compte sur votre appareil Apple avant de réessayer ici." },
     anisette: { title: "Le service de connexion est indisponible", message: "La connexion n’a pas pu être préparée. Vérifiez votre accès à Internet, puis réessayez plus tard. Aucune boucle de connexion n’est lancée." },
     download: { title: "Le téléchargement n’a pas abouti", message: "Vérifiez votre connexion Internet. Vous pourrez relancer la préparation lorsque le téléchargement sera accessible." },

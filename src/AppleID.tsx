@@ -26,6 +26,9 @@ export const AppleID = ({ loggedInAs, setLoggedInAs, noKeyringAvailable, disable
   const [signingStatus, setSigningStatus] = useState<SigningStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [ready, setReady] = useState(false);
+  const [setupAttempt, setSetupAttempt] = useState(0);
+  const [listenerFailed, setListenerFailed] = useState(false);
+  const [passwordCleared, setPasswordCleared] = useState(false);
   const [canceling, setCanceling] = useState(false);
   const [code, setCode] = useState("");
   const [codeSent, setCodeSent] = useState(false);
@@ -64,7 +67,13 @@ export const AppleID = ({ loggedInAs, setLoggedInAs, noKeyringAvailable, disable
         const account = await invoke<string | null>("logged_in_as");
         const status = account ? await verifiedSigningStatus() : null;
         if (!disposed) { setSigningStatus(status); setLoggedInAs(account); setReady(true); }
-      } catch (failure) { if (!disposed) { setSigningStatus(null); setLoggedInAs(null); setError(failure); setReady(true); } }
+      } catch (failure) {
+        if (disposed) return;
+        setSigningStatus(null); setLoggedInAs(null);
+        setListenerFailed(!unlisten);
+        setReady(Boolean(unlisten));
+        setError(unlisten ? failure : { type: "verification_unavailable" });
+      }
     }
     void prepare();
     return () => {
@@ -72,14 +81,14 @@ export const AppleID = ({ loggedInAs, setLoggedInAs, noKeyringAvailable, disable
       if (active.current) void invoke("cancel_login").catch(() => {});
       active.current = false; onBusyChange(false);
     };
-  }, [setLoggedInAs, onBusyChange]);
+  }, [setLoggedInAs, onBusyChange, setupAttempt]);
   useEffect(() => { if (needsCode) codeInput.current?.focus(); }, [needsCode, challenge?.requestId]);
   useEffect(() => { if (challenge?.unknown) deviceMethod.current?.focus(); }, [challenge]);
 
   async function login() {
     if (active.current || disabled || noKeyringAvailable || !ready || !email.trim() || !password) return;
     const request = ++attempt.current;
-    setError(null); setCodeSent(false); setChallenge(null); setSigningStatus(null); setWorking(true);
+    setError(null); setPasswordCleared(false); setCodeSent(false); setChallenge(null); setSigningStatus(null); setWorking(true);
     try {
       const pending = invoke("login_new", { email: email.trim(), password, saveCredentials: false, anisetteServer: ANISETTE_SERVER, reuseExistingSignature });
       pendingLogin.current = pending;
@@ -91,7 +100,9 @@ export const AppleID = ({ loggedInAs, setLoggedInAs, noKeyringAvailable, disable
       const status = await verifiedSigningStatus();
       if (reuseExistingSignature && status.mode !== "existing") throw { type: "existing_signature", message: "Code : EXISTING-UNVERIFIED" };
       if (mounted.current && request === attempt.current) { setSigningStatus(status); setLoggedInAs(account); }
-    } catch (failure) { if (mounted.current && request === attempt.current) setError(failure); }
+    } catch (failure) {
+      if (mounted.current && request === attempt.current) { setError(failure); setPasswordCleared(true); }
+    }
     finally {
       if (mounted.current && request === attempt.current) { pendingLogin.current = null; setWorking(false); setChallenge(null); setCode(""); setPassword(""); }
     }
@@ -113,17 +124,17 @@ export const AppleID = ({ loggedInAs, setLoggedInAs, noKeyringAvailable, disable
     if (!/^\d{6}$/.test(code) || canceling || !challenge || challenge.unknown || responseInFlight.current) return;
     const requestId = challenge.requestId, submittedCode = code;
     responseInFlight.current = true; setChallengeSending(true);
-    setCode(""); setCodeSent(true);
+    setError(null); setCode(""); setCodeSent(true);
     try { await emit("2fa-recieved", { requestId, action: "submit-code", code: submittedCode }); setChallenge(current => current?.requestId === requestId ? null : current); }
-    catch (failure) { setError(failure); }
+    catch { setError({ type: "verification_delivery" }); setCodeSent(false); }
     finally { responseInFlight.current = false; setChallengeSending(false); }
   }
   async function requestCode(action: "request-device-code" | "request-sms-code", phoneId?: number) {
     if (!challenge?.unknown || canceling || responseInFlight.current) return;
     const requestId = challenge.requestId;
-    responseInFlight.current = true; setChallengeSending(true);
+    responseInFlight.current = true; setChallengeSending(true); setError(null);
     try { await emit("2fa-recieved", { requestId, action, ...(phoneId !== undefined ? { phoneId } : {}) }); setChallenge(current => current?.requestId === requestId ? null : current); }
-    catch (failure) { setError(failure); }
+    catch { setError({ type: "verification_delivery" }); }
     finally { responseInFlight.current = false; setChallengeSending(false); }
   }
   async function signOut() {
@@ -138,7 +149,8 @@ export const AppleID = ({ loggedInAs, setLoggedInAs, noKeyringAvailable, disable
     {loggedInAs ? <div className="ni-notice ni-account-connected"><FiCheck aria-hidden="true" /><div><strong>Compte Apple connecté</strong><p>{loggedInAs}</p>{signingStatus?.mode === "existing" && signingStatus.verified && <p role="status"><strong>Signature existante vérifiée</strong>La signature iloader sera réutilisée. Aucun certificat ne sera créé ni révoqué.</p>}<button className="ni-text-button" disabled={disabled || busy} type="button" onClick={() => void signOut()}>Modifier la connexion</button></div></div>
       : <form className="ni-login-form" onSubmit={event => { event.preventDefault(); void login(); }}>
         <label htmlFor="apple-email">Compte Apple<input id="apple-email" name="apple-email" type="text" inputMode="email" autoComplete="username" autoCapitalize="none" spellCheck={false} value={email} onChange={event => setEmail(event.target.value)} disabled={disabled || busy || noKeyringAvailable} placeholder="Votre adresse e-mail ou numéro" required /></label>
-        <label htmlFor="apple-password">Mot de passe<input id="apple-password" name="apple-password" type="password" autoComplete="current-password" value={password} onChange={event => setPassword(event.target.value)} disabled={disabled || busy || noKeyringAvailable} required /></label>
+        <label htmlFor="apple-password">Mot de passe<input id="apple-password" name="apple-password" type="password" autoComplete="current-password" value={password} aria-describedby={passwordCleared ? "password-cleared" : undefined} onChange={event => { setPassword(event.target.value); setPasswordCleared(false); }} disabled={disabled || busy || noKeyringAvailable} required /></label>
+        {passwordCleared && <p id="password-cleared" className="ni-caption">Par confidentialité, le champ du mot de passe a été vidé après cette tentative.</p>}
         <div className="ni-signature-choice"><label className="ni-checkbox-label" htmlFor="reuse-existing-signature"><input id="reuse-existing-signature" type="checkbox" checked={reuseExistingSignature} onChange={event => setReuseExistingSignature(event.target.checked)} disabled={disabled || busy || noKeyringAvailable || !ready} aria-describedby="reuse-existing-description" /><span>Réutiliser ma signature iloader existante</span></label><p id="reuse-existing-description" className="ni-caption">Cette option autorise la lecture de la seule clé de signature iloader de ce compte dans le trousseau de cet ordinateur. Dans ce mode, aucun certificat n’est créé ni révoqué ; vos apps actuelles sont conservées.</p></div>
         <p className="ni-caption"><FiLock aria-hidden="true" />Le mot de passe n’est pas mémorisé. La validation Apple peut demander un code sur votre appareil.</p>
         {!busy && <NanashiButton primary type="submit" disabled={disabled || noKeyringAvailable || !ready || !email.trim() || !password}>Se connecter à Apple</NanashiButton>}
@@ -146,7 +158,8 @@ export const AppleID = ({ loggedInAs, setLoggedInAs, noKeyringAvailable, disable
     {challenge?.hasError && <p className="ni-notice" role="status">Apple demande une nouvelle validation. Vérifiez la méthode choisie et utilisez le dernier code reçu.</p>}
     {challenge?.unknown && <section className="ni-code-panel" aria-labelledby="verification-method"><h3 id="verification-method">Où recevoir le code Apple ?</h3><p>Choisissez une méthode proposée par votre compte.</p><div className="ni-methods"><button ref={deviceMethod} className="ni-button ni-primary" type="button" disabled={canceling || challengeSending} onClick={() => void requestCode("request-device-code")}>Sur mes appareils Apple</button>{challenge.numbers.filter(number => Number.isInteger(number.id) && typeof number.label === "string").map(number => <NanashiButton key={number.id} type="button" disabled={canceling || challengeSending} onClick={() => void requestCode("request-sms-code", number.id)}>Par SMS · ••••{number.label.replace(/\D/g, "").slice(-2)}</NanashiButton>)}</div></section>}
     {needsCode && <section className="ni-code-panel" aria-labelledby="verification-title"><h3 id="verification-title">{challenge?.sms ? "Le code reçu par SMS" : "Le code reçu sur votre appareil Apple"}</h3><p>Saisissez les six chiffres pour terminer la connexion.</p><form onSubmit={event => { event.preventDefault(); void sendCode(); }}><label htmlFor="apple-code">Code de validation<input ref={codeInput} id="apple-code" type="text" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} value={code} onChange={event => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))} disabled={canceling || challengeSending} /></label><NanashiButton primary type="submit" disabled={code.length !== 6 || canceling || challengeSending}>Valider le code</NanashiButton></form></section>}
-    {busy && <div className="ni-auth-status"><p role="status">{canceling ? "Annulation en cours…" : needsCode ? "En attente du code Apple." : reuseExistingSignature ? "Connexion et vérification de la signature existante…" : codeSent ? "Vérification du code…" : "Connexion à Apple en cours…"}</p><button className="ni-text-button" type="button" disabled={canceling} onClick={() => void cancelLogin()}>Annuler la connexion</button></div>}
+    {busy && <div className="ni-auth-status"><p role="status">{canceling ? "Annulation en cours…" : challenge?.unknown ? "Choisissez où recevoir votre code." : needsCode ? "En attente du code Apple." : codeSent ? "Vérification du code…" : "Connexion à Apple en cours…"}</p><button className="ni-text-button" type="button" disabled={canceling} onClick={() => void cancelLogin()}>Annuler la connexion</button></div>}
     {error !== null && <NanashiError error={error} />}
+    {listenerFailed && <NanashiButton type="button" onClick={() => { setError(null); setListenerFailed(false); setSetupAttempt(current => current + 1); }}>Réactiver la validation</NanashiButton>}
   </div>;
 };

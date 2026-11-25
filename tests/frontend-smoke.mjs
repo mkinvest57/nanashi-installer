@@ -38,9 +38,13 @@ async function fixture(scenario = "success", viewport = { width: 980, height: 76
           return { mode: reuseRequested && scenario !== "reuse-mode-mismatch" ? "existing" : "standard", verified: reuseRequested && scenario !== "reuse-unverified" };
         }
         if (command === "invalidate_account") { account = null; return null; }
-        if (command === "plugin:event|listen") { const listenerId = ++id; listeners.set(listenerId, args); return listenerId; }
+        if (command === "plugin:event|listen") {
+          if (args.event === "2fa-required" && scenario === "listener-error" && !window.__nanashiMock.listenerReady) throw "FAKE_SECRET_DO_NOT_DISPLAY";
+          const listenerId = ++id; listeners.set(listenerId, args); return listenerId;
+        }
         if (command === "plugin:event|unlisten") { listeners.delete(args.eventId); return null; }
         if (command === "plugin:event|emit") {
+          if (args.event === "2fa-recieved" && scenario === "delivery-error" && !window.__nanashiMock.deliveryReady) throw "FAKE_SECRET_DO_NOT_DISPLAY";
           if (args.event === "2fa-recieved" && args.payload.action === "submit-code") { account = "preview@example.invalid"; resolveLogin?.(); }
           // A native follow-up can arrive before the emit acknowledgement resolves.
           else if (args.event === "2fa-recieved") notify("2fa-required", { requestId: "test-request-code", unknown: false, sms: args.payload.action === "request-sms-code", numbers: [], selectedNumberId: 42, hasError: false });
@@ -48,9 +52,11 @@ async function fixture(scenario = "success", viewport = { width: 980, height: 76
         }
         if (command === "login_new") {
           reuseRequested = args.reuseExistingSignature === true;
+          if (scenario === "expire-challenge") window.__nanashiMock.expireChallenge = () => rejectLogin({ type: "auth", message: "Code : AUTH-2FA-TIMEOUT." });
           const reuseErrorMarkers = { "reuse-missing-key": "EXISTING-KEY-MISSING", "reuse-certificate-mismatch": "EXISTING-CERTIFICATE-MISMATCH", "reuse-network": "EXISTING-NETWORK", "reuse-guard": "EXISTING-GUARD", "reuse-unknown-error": "EXISTING-KEY-MISSING-UNTRUSTED" };
           if (reuseErrorMarkers[scenario]) throw { type: "existing_signature", message: `Code : ${reuseErrorMarkers[scenario]}. FAKE_SECRET_DO_NOT_DISPLAY` };
-          if (scenario === "auth-error") throw { type: "auth", message: "-80045 FAKE_SECRET_DO_NOT_DISPLAY apple-network-body" };
+          if (scenario === "auth-error") throw { type: "auth", message: "Apple a refusé la demande (-80045). FAKE_SECRET_DO_NOT_DISPLAY" };
+          if (scenario.startsWith("AUTH-")) throw { type: scenario === "AUTH-PROVIDER" ? "anisette" : "auth", message: `${scenario === "AUTH-SERVICE" ? "Le service de connexion a renvoyé une erreur HTTP 503. " : ""}Code : ${scenario}. FAKE_SECRET_DO_NOT_DISPLAY -80045` };
           if (scenario === "certificate-limit") throw { type: "developer", message: "La limite de certificats Apple est atteinte. FAKE_SECRET_DO_NOT_DISPLAY" };
           if (scenario === "cancel-login") return new Promise((resolve, reject) => { resolveLogin = resolve; rejectLogin = reject; });
           return new Promise((resolve, reject) => { resolveLogin = resolve; rejectLogin = reject; setTimeout(() => notify("2fa-required", { requestId: scenario === "choose-method" ? "test-request-method" : "test-request-code", unknown: scenario === "choose-method", sms: false, numbers: scenario === "choose-method" ? [{ id: 42, label: "••••42" }] : [], selectedNumberId: null, hasError: false }), 0); });
@@ -159,6 +165,77 @@ await run("Apple -80045 is visible without raw response or automatic retries", a
   await expect(page.locator("body")).not.toContainText("FAKE_SECRET_DO_NOT_DISPLAY");
   await expect(page.getByLabel("Mot de passe", { exact: true })).toHaveValue("");
   expect(await page.evaluate(() => window.__nanashiMock.calls.filter(call => call.command === "login_new").length)).toBe(1);
+  expect(errors).toEqual([]); await context.close();
+});
+for (const [scenario, title] of [
+  ["AUTH-DISCOVERY", "Les services Apple n’ont pas pu être préparés"],
+  ["AUTH-SIGN-IN", "La connexion au compte Apple n’a pas abouti"],
+  ["AUTH-2FA", "La validation en deux étapes n’a pas abouti"],
+  ["AUTH-DEVELOPER-SESSION", "La session de signature Apple n’a pas pu être ouverte"],
+  ["AUTH-NETWORK", "La connexion réseau a été interrompue"],
+  ["AUTH-SERVICE", "Le service de connexion est temporairement indisponible"],
+  ["AUTH-RATE-LIMIT", "Le service demande d’espacer les tentatives"],
+  ["AUTH-TIMEOUT", "Le délai de connexion est dépassé"],
+  ["AUTH-2FA-TIMEOUT", "Le délai de validation du code est dépassé"],
+  ["AUTH-PROVIDER", "Le service de préparation de la connexion est indisponible"],
+  ["AUTH-2FA-UNRECOGNIZED", "La connexion Apple n’a pas abouti"],
+]) await run(`${scenario} gives only the matching recovery action and keeps the submitted account`, async () => {
+  const { context, page, errors } = await fixture(scenario); await selectPhone(page);
+  const reuse = page.getByRole("checkbox", { name: "Réutiliser ma signature iloader existante" });
+  await reuse.check(); await submitLogin(page);
+  const alert = page.getByRole("alert");
+  await expect(alert).toContainText(title);
+  if (!scenario.endsWith("UNRECOGNIZED")) await expect(alert).toContainText(`(${scenario})`);
+  if (scenario === "AUTH-SERVICE") await expect(alert).toContainText("HTTP 503");
+  await expect(alert).not.toContainText(/-80045|UNRECOGNIZED|FAKE_SECRET_DO_NOT_DISPLAY|Vérifiez vos identifiants/);
+  await expect(page.getByRole("textbox", { name: "Compte Apple", exact: true })).toHaveValue("preview@example.invalid");
+  await expect(reuse).toBeChecked();
+  const password = page.getByLabel("Mot de passe", { exact: true });
+  await expect(password).toHaveValue("");
+  await expect(password).toHaveAccessibleDescription(/champ du mot de passe a été vidé/);
+  expect(await page.evaluate(() => window.__nanashiMock.calls.filter(call => call.command === "login_new").map(call => call.args.password))).toEqual(["fixture-not-a-real-password"]);
+  await expect(page.getByRole("button", { name: "Continuer", exact: true })).toBeDisabled();
+  expect(errors).toEqual([]); await context.close();
+});
+await run("login waits for a verification listener and resumes only on manual submit", async () => {
+  const { context, page, errors } = await fixture("listener-error"); await selectPhone(page);
+  const login = page.getByRole("button", { name: "Se connecter à Apple" });
+  await page.getByRole("textbox", { name: "Compte Apple", exact: true }).fill("preview@example.invalid");
+  await page.getByLabel("Mot de passe", { exact: true }).fill("fixture-not-a-real-password");
+  await expect(login).toBeDisabled();
+  await expect(page.getByRole("alert")).toContainText("ne peut pas recevoir la validation Apple");
+  await expect(page.locator("body")).not.toContainText("FAKE_SECRET_DO_NOT_DISPLAY");
+  await page.evaluate(() => { window.__nanashiMock.listenerReady = true; });
+  await page.getByRole("button", { name: "Réactiver la validation" }).click();
+  await expect(login).toBeEnabled();
+  expect(await page.evaluate(() => window.__nanashiMock.calls.filter(call => call.command === "login_new"))).toHaveLength(0);
+  await login.click(); await expect(page.getByLabel("Code de validation")).toBeFocused();
+  expect(errors).toEqual([]); await context.close();
+});
+await run("a failed code submission keeps the current challenge available for a manual retry", async () => {
+  const { context, page, errors } = await fixture("delivery-error"); await selectPhone(page); await submitLogin(page);
+  const code = page.getByLabel("Code de validation"), submit = page.getByRole("button", { name: "Valider le code" });
+  await code.fill("123456"); await submit.click();
+  await expect(page.getByRole("alert")).toContainText("La réponse de validation n’a pas été transmise");
+  await expect(code).toHaveValue(""); await expect(code).toBeEnabled();
+  await expect(page.locator("body")).not.toContainText("FAKE_SECRET_DO_NOT_DISPLAY");
+  await page.evaluate(() => { window.__nanashiMock.deliveryReady = true; });
+  await code.fill("123456"); await submit.click();
+  await expect(page.getByText("Compte Apple connecté", { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => window.__nanashiMock.calls.filter(call => call.command === "login_new"))).toHaveLength(1);
+  expect(errors).toEqual([]); await context.close();
+});
+await run("a verification timeout dismisses the expired prompt and preserves the selected signing mode", async () => {
+  const { context, page, errors } = await fixture("expire-challenge"); await selectPhone(page);
+  const reuse = page.getByRole("checkbox", { name: "Réutiliser ma signature iloader existante" });
+  await reuse.check(); await submitLogin(page);
+  await expect(page.getByLabel("Code de validation")).toBeFocused();
+  await page.evaluate(() => window.__nanashiMock.expireChallenge());
+  await expect(page.getByRole("alert")).toContainText("AUTH-2FA-TIMEOUT");
+  await expect(page.getByLabel("Code de validation")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Se connecter à Apple" })).toBeDisabled();
+  await expect(reuse).toBeChecked();
+  expect(await page.evaluate(() => window.__nanashiMock.calls.filter(call => call.command === "login_new"))).toHaveLength(1);
   expect(errors).toEqual([]); await context.close();
 });
 await run("a phone plugged in after launch appears automatically without starting pairing", async () => {

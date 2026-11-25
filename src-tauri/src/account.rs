@@ -82,24 +82,45 @@ fn validate_stored_anisette_state(bytes: &[u8]) -> Result<(), AppError> {
 // Keep the upstream protocol, but do not silently reset an existing ADI identity.
 struct PreservingAnisetteProvider(RemoteV3AnisetteProvider);
 
+impl PreservingAnisetteProvider {
+    fn from_storage(
+        anisette_url: &str,
+        storage: Box<dyn isideload::util::storage::SideloadingStorage>,
+    ) -> Result<Self, AppError> {
+        // Upstream treats unreadable stored state as absent and has an unchecked
+        // 16-byte conversion. Validate first, then load explicitly without replacing it.
+        let state_data = storage.retrieve_data(
+                isideload::anisette::remote_v3::ANISETTE_STATE_KEY,
+        ).map_err(|_| AppError::Keyring("Impossible de lire l’état de connexion dans le trousseau. Il est conservé sans modification.".into()))?;
+        if let Some(bytes) = state_data.as_ref() {
+            validate_stored_anisette_state(bytes)?;
+        }
+        let mut remote_anisette =
+            RemoteV3AnisetteProvider::new(anisette_url, storage, "0".to_string())
+                .map_err(|error| classify_auth_error(error, AuthStage::Provider))?;
+        if let Some(bytes) = state_data {
+            remote_anisette.state = Some(
+                plist::from_bytes(&bytes)
+                    .map_err(|_| AppError::Anisette(ANISETTE_STATE_PRESERVED.into()))?,
+            );
+        }
+        // Use metadata supplied by the configured provider for this session.
+        Ok(Self(remote_anisette))
+    }
+}
+
 #[async_trait::async_trait]
 impl AnisetteProvider for PreservingAnisetteProvider {
     async fn get_anisette_data(&self) -> Result<AnisetteDataResponse, rootcause::Report> {
-        tokio::time::timeout(ANISETTE_TIMEOUT, self.0.get_anisette_data())
-            .await
-            .context("Anisette request timed out")?
+        provider_request(self.0.get_anisette_data()).await
     }
 
     async fn resync(&self, sim: &str) -> Result<AnisetteDataResponse, rootcause::Report> {
-        tokio::time::timeout(ANISETTE_TIMEOUT, self.0.resync(sim))
-            .await
-            .context("Anisette synchronization timed out")?
+        provider_request(self.0.resync(sim)).await
     }
 
     async fn get_client_info(&self) -> Result<AnisetteClientInfo, rootcause::Report> {
-        tokio::time::timeout(ANISETTE_TIMEOUT, self.0.get_client_info())
-            .await
-            .context("Anisette client information timed out")?
+        provider_request(self.0.get_client_info()).await
     }
 
     async fn provision(
@@ -108,10 +129,19 @@ impl AnisetteProvider for PreservingAnisetteProvider {
         force_reset: bool,
     ) -> Result<(), rootcause::Report> {
         reject_anisette_reset(force_reset)?;
-        tokio::time::timeout(ANISETTE_TIMEOUT, self.0.provision(gs, false))
-            .await
-            .context("Anisette provisioning timed out")?
+        provider_request(self.0.provision(gs, false)).await
     }
+}
+
+// Preserve the provider stage across SDK contexts, including errors before the
+// Apple ID exchange. Do not expose server responses or keychain contents.
+async fn provider_request<T>(
+    request: impl Future<Output = Result<T, rootcause::Report>>,
+) -> Result<T, rootcause::Report> {
+    tokio::time::timeout(ANISETTE_TIMEOUT, request)
+        .await
+        .map_err(|_| rootcause::report!(AuthStage::Provider))?
+        .map_err(|report| report.context(AuthStage::Provider).into())
 }
 
 struct LoginAttempt(CancellationToken);
@@ -289,16 +319,34 @@ fn two_factor_response(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum AuthDeadline {
+    Login,
+    TwoFactor,
+}
+
+impl AuthDeadline {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Login => "Le délai de connexion Apple est écoulé. Code : AUTH-TIMEOUT.",
+            Self::TwoFactor => {
+                "Le délai de saisie de la validation Apple est écoulé. Code : AUTH-2FA-TIMEOUT."
+            }
+        }
+    }
+}
+
 async fn bounded_auth<T>(
     future: impl Future<Output = Result<T, AppError>>,
     cancellation: CancellationToken,
     timeout: Duration,
+    deadline: AuthDeadline,
 ) -> Result<T, AppError> {
     tokio::select! {
         biased;
         _ = cancellation.cancelled() => Err(AppError::Canceled("Connexion Apple".into())),
         result = tokio::time::timeout(timeout, future) => result.map_err(|_| {
-            AppError::Auth("Le délai de connexion Apple est dépassé. Aucune nouvelle tentative automatique n’a été lancée.".into())
+            AppError::Auth(deadline.message().into())
         })?,
     }
 }
@@ -318,16 +366,50 @@ async fn wait_for_two_factor_response(
         },
         cancellation,
         TWO_FACTOR_TIMEOUT,
+        AuthDeadline::TwoFactor,
     )
     .await
 }
 
-// Do not forward raw authentication responses, headers or server bodies to UI/logs.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("{self:?}")]
+enum AuthStage {
+    Provider,
+    Discovery,
+    SignIn,
+    TwoFactor,
+    DeveloperSession,
+}
+
+impl AuthStage {
+    fn error(self) -> AppError {
+        match self {
+            Self::Provider => AppError::Anisette("Le service de préparation de la connexion n’a pas pu terminer sa demande. Code : AUTH-PROVIDER.".into()),
+            Self::Discovery => AppError::Auth("Impossible de préparer la connexion aux services Apple. Code : AUTH-DISCOVERY.".into()),
+            Self::SignIn => AppError::Auth("L’échange de connexion avec Apple s’est interrompu. Code : AUTH-SIGN-IN.".into()),
+            Self::TwoFactor => AppError::Auth("La vérification en deux étapes n’a pas abouti. Code : AUTH-2FA.".into()),
+            Self::DeveloperSession => AppError::Auth("La connexion Apple a abouti, mais la session développeur n’a pas pu être préparée. Code : AUTH-DEVELOPER-SESSION.".into()),
+        }
+    }
+}
+
+// Installation preflight calls this after the Apple account has signed in.
 pub(crate) fn safe_auth_error(report: rootcause::Report) -> AppError {
+    classify_auth_error(report, AuthStage::DeveloperSession)
+}
+
+// Do not forward raw authentication responses, attachments, headers or URLs.
+fn classify_auth_error(report: rootcause::Report, mut stage: AuthStage) -> AppError {
     if let Some(error) = crate::error::preserved_signature_error(&report) {
         return error;
     }
+    let mut transport_failed = false;
+    let mut rate_limited = false;
+    let mut server_status = None;
     for cause in report.iter_reports() {
+        if let Some(origin) = cause.downcast_current_context::<AuthStage>() {
+            stage = *origin;
+        }
         if cause
             .downcast_current_context::<CertificatesPreserved>()
             .is_some()
@@ -340,12 +422,19 @@ pub(crate) fn safe_auth_error(report: rootcause::Report) -> AppError {
         {
             return AppError::Anisette(AnisetteResetBlocked.to_string());
         }
+        if let Some(error) = cause.downcast_current_context::<AppError>() {
+            match error {
+                AppError::Canceled(_) => return AppError::Canceled("Vérification Apple".into()),
+                AppError::Auth(message) if message == AuthDeadline::TwoFactor.message() => {
+                    return AppError::Auth(AuthDeadline::TwoFactor.message().into());
+                }
+                _ => {}
+            }
+        }
         if let Some(error) = cause.downcast_current_context::<isideload::SideloadError>() {
             match error {
                 isideload::SideloadError::AuthWithMessage(code, _) => {
-                    return AppError::Auth(format!(
-                        "Apple a refusé la connexion ({code}). Aucun nouvel essai automatique n’a été lancé."
-                    ));
+                    return AppError::Auth(format!("Apple a refusé la demande ({code})."));
                 }
                 isideload::SideloadError::DeveloperError(code, _) => {
                     return AppError::Developer(format!(
@@ -355,8 +444,62 @@ pub(crate) fn safe_auth_error(report: rootcause::Report) -> AppError {
                 _ => {}
             }
         }
+        let request = cause
+            .downcast_current_context::<reqwest::Error>()
+            .or_else(
+                || match cause.downcast_current_context::<reqwest_middleware::Error>() {
+                    Some(reqwest_middleware::Error::Reqwest(error)) => Some(error),
+                    _ => None,
+                },
+            );
+        if let Some(request) = request {
+            rate_limited |= request.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS);
+            if let Some(status) = request
+                .status()
+                .filter(reqwest::StatusCode::is_server_error)
+            {
+                server_status = Some(status.as_u16());
+            }
+            transport_failed |= request.is_connect() || request.is_timeout() || request.is_body();
+        }
+        // In these cases the pinned SDK only emits a fixed context.
+        let context = cause
+            .downcast_current_context::<&'static str>()
+            .copied()
+            .or_else(|| {
+                cause
+                    .downcast_current_context::<String>()
+                    .map(String::as_str)
+            });
+        match context {
+            Some("Received 429 Too Many Requests, no retries left") => rate_limited = true,
+            Some(
+                "Failed to complete trusted device 2FA"
+                | "Failed to complete SMS 2FA"
+                | "Failed to verify trusted device 2FA",
+            ) => stage = AuthStage::TwoFactor,
+            _ => {}
+        }
     }
-    AppError::Auth("La connexion Apple n’a pas abouti. Vérifiez votre connexion et le code de validation, puis réessayez manuellement.".into())
+    if rate_limited {
+        return AppError::Auth("Le service limite temporairement les tentatives. Réessayez plus tard. Code : AUTH-RATE-LIMIT.".into());
+    }
+    if let Some(status) = server_status {
+        return AppError::Auth(format!(
+            "Le service de connexion a renvoyé une erreur HTTP {status}. Code : AUTH-SERVICE."
+        ));
+    }
+    if transport_failed
+        && !matches!(
+            stage,
+            AuthStage::Provider | AuthStage::DeveloperSession | AuthStage::TwoFactor
+        )
+    {
+        return AppError::Auth(
+            "La communication réseau avec Apple a été interrompue. Code : AUTH-NETWORK.".into(),
+        );
+    }
+    stage.error()
 }
 
 fn blocked_certificate_selection() -> Result<Option<Vec<String>>, rootcause::Report> {
@@ -528,6 +671,7 @@ async fn login(
         ),
         attempt.0.clone(),
         LOGIN_TIMEOUT,
+        AuthDeadline::Login,
     )
     .await
 }
@@ -542,22 +686,7 @@ async fn login_inner(
     cancellation: CancellationToken,
     reuse_existing_signature: bool,
 ) -> Result<AuthenticatedSideloader, AppError> {
-    // Upstream treats unreadable stored state as absent and has an unchecked
-    // 16-byte conversion. Validate first, then load explicitly without replacing it.
-    let state_data = storage.retrieve_data(
-        isideload::anisette::remote_v3::ANISETTE_STATE_KEY,
-    ).map_err(|_| AppError::Keyring("Impossible de lire l’état de connexion dans le trousseau. Il est conservé sans modification.".into()))?;
-    if let Some(bytes) = state_data.as_ref() {
-        validate_stored_anisette_state(bytes)?;
-    }
-    let mut remote_anisette = RemoteV3AnisetteProvider::new(anisette_url, storage, "0".to_string())
-        .map_err(safe_auth_error)?;
-    if let Some(bytes) = state_data {
-        remote_anisette.state = Some(
-            plist::from_bytes(&bytes)
-                .map_err(|_| AppError::Anisette(ANISETTE_STATE_PRESERVED.into()))?,
-        );
-    }
+    let provider = PreservingAnisetteProvider::from_storage(anisette_url, storage)?;
     let tfa_closure = {
         let window_clone = window.clone();
         move |params: TwoFactorCallbackParams| {
@@ -576,8 +705,10 @@ async fn login_inner(
                 };
                 window_clone
                     .emit("2fa-required", &challenge)
-                    .context("Failed to show Apple verification")?;
-                Ok(wait_for_two_factor_response(rx, cancellation, &challenge).await?)
+                    .context(AuthStage::TwoFactor)?;
+                Ok(wait_for_two_factor_response(rx, cancellation, &challenge)
+                    .await
+                    .context(AuthStage::TwoFactor)?)
             }
             .boxed()
         }
@@ -585,19 +716,10 @@ async fn login_inner(
 
     let mut account = AppleAccount::builder(&email.to_lowercase())
         .err_429_retries(Some(0))
-        .anisette_provider(PreservingAnisetteProvider(
-            remote_anisette
-                // Retain the upstream iloader v2.4.1 compatibility configuration.
-                .set_client_info_override(Some(AnisetteClientInfo {
-                    client_info:
-                        "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
-                            .to_string(),
-                    user_agent: "akd/1.0 CFNetwork/811.5.4".to_string(),
-                })),
-        ))
+        .anisette_provider(provider)
         .build()
         .await
-        .map_err(safe_auth_error)?;
+        .map_err(|error| classify_auth_error(error, AuthStage::Discovery))?;
 
     let certificate_guard = if reuse_existing_signature {
         Some(crate::existing_signing::install_certificate_guard(
@@ -609,7 +731,7 @@ async fn login_inner(
     account
         .login(password, Box::new(tfa_closure))
         .await
-        .map_err(safe_auth_error)?;
+        .map_err(|error| classify_auth_error(error, AuthStage::SignIn))?;
 
     let mut dev_session = DeveloperSession::from_account(&mut account)
         .await
@@ -949,6 +1071,106 @@ mod tests {
         assert!(!message.contains("private-context"));
     }
 
+    #[test]
+    fn unclassified_causes_keep_the_failing_stage_without_server_responses() {
+        for (stage, marker) in [
+            (AuthStage::Discovery, "AUTH-DISCOVERY"),
+            (AuthStage::SignIn, "AUTH-SIGN-IN"),
+            (AuthStage::Provider, "AUTH-PROVIDER"),
+            (AuthStage::TwoFactor, "AUTH-2FA"),
+            (AuthStage::DeveloperSession, "AUTH-DEVELOPER-SESSION"),
+        ] {
+            let report = rootcause::report!("secret content").attach("secret attachment");
+            let error = classify_auth_error(report, stage);
+            assert!(error.to_string().contains(marker));
+            assert!(!error.to_string().contains("secret"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_failure_and_verification_errors_keep_their_origin_through_the_sdk() {
+        let provider = provider_request(async { Err::<(), _>(rootcause::report!("secret")) })
+            .await
+            .context("Failed to get anisette data for login")
+            .unwrap_err();
+        let error = classify_auth_error(provider.into(), AuthStage::SignIn);
+        assert!(matches!(error, AppError::Anisette(_)));
+        assert!(error.to_string().contains("AUTH-PROVIDER"));
+        let report = rootcause::report!("private response").context("Failed to complete SMS 2FA");
+        assert!(
+            classify_auth_error(report.into(), AuthStage::SignIn)
+                .to_string()
+                .contains("AUTH-2FA")
+        );
+        for (cause, marker, category) in [
+            (
+                AppError::Canceled("secret".into()),
+                "Vérification Apple",
+                "canceled",
+            ),
+            (
+                AppError::Auth(AuthDeadline::TwoFactor.message().into()),
+                "AUTH-2FA-TIMEOUT",
+                "auth",
+            ),
+        ] {
+            let report = rootcause::report!(cause).context(AuthStage::TwoFactor);
+            let error = classify_auth_error(report.into(), AuthStage::SignIn);
+            assert_eq!(error.as_ref(), category);
+            assert!(error.to_string().contains(marker));
+            assert!(!error.to_string().contains("secret"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn normal_setup_reads_client_information_from_the_provider() {
+        // An invalid URL fails locally, before any network request. A hardcoded
+        // client-info override would return success and mask this failure.
+        let storage = Box::new(isideload::util::storage::InMemoryStorage::new());
+        let provider = PreservingAnisetteProvider::from_storage("invalid-url", storage).unwrap();
+        let report = provider
+            .get_client_info()
+            .await
+            .expect_err("provider metadata is required");
+        let error = classify_auth_error(report, AuthStage::Discovery);
+        assert!(error.to_string().contains("AUTH-PROVIDER"));
+    }
+
+    #[test]
+    fn service_failure_reports_only_the_http_status() {
+        let status = http::Response::builder()
+            .status(503)
+            .body("secret body")
+            .unwrap();
+        let request_error = reqwest::Response::from(status)
+            .error_for_status()
+            .unwrap_err()
+            .with_url(reqwest::Url::parse("https://example.invalid/private-token").unwrap());
+        let report = rootcause::report!(request_error).context("secret diagnostic");
+        let error = classify_auth_error(report.into(), AuthStage::SignIn);
+        assert!(error.to_string().contains("AUTH-SERVICE"));
+        assert!(error.to_string().contains("HTTP 503"));
+        assert!(!error.to_string().contains("secret"));
+        assert!(!error.to_string().contains("private-token"));
+    }
+
+    #[test]
+    fn rate_limits_keep_a_safe_diagnostic_with_or_without_sdk_context() {
+        let status = http::Response::builder().status(429).body("").unwrap();
+        let request_error = reqwest::Response::from(status)
+            .error_for_status()
+            .unwrap_err();
+        for report in [
+            rootcause::report!("Received 429 Too Many Requests, no retries left"),
+            rootcause::report!(reqwest_middleware::Error::Reqwest(request_error)),
+        ] {
+            let report = report.context("secret request URL");
+            let error = classify_auth_error(report.into(), AuthStage::SignIn);
+            assert!(error.to_string().contains("AUTH-RATE-LIMIT"));
+            assert!(!error.to_string().contains("secret"));
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn waiting_for_two_factor_does_not_block_the_executor() {
         let (sender, receiver) = mpsc::channel(1);
@@ -983,8 +1205,22 @@ mod tests {
             std::future::pending(),
             CancellationToken::new(),
             Duration::from_millis(2),
+            AuthDeadline::Login,
         )
         .await;
-        assert!(matches!(result, Err(AppError::Auth(_))));
+        assert!(result.unwrap_err().to_string().contains("AUTH-TIMEOUT"));
+        let verification: Result<(), _> = bounded_auth(
+            std::future::pending(),
+            CancellationToken::new(),
+            Duration::from_millis(2),
+            AuthDeadline::TwoFactor,
+        )
+        .await;
+        assert!(
+            verification
+                .unwrap_err()
+                .to_string()
+                .contains("AUTH-2FA-TIMEOUT")
+        );
     }
 }
