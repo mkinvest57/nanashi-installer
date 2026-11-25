@@ -6,7 +6,7 @@ use std::{
 // used https://github.com/jkcoxson/idevice_pair/ as a guide
 use idevice::{
     IdeviceError, IdeviceService,
-    afc::AfcClient,
+    afc::{AfcClient, errors::AfcError},
     house_arrest::HouseArrestClient,
     installation_proxy::InstallationProxyClient,
     lockdown::LockdownClient,
@@ -152,7 +152,7 @@ async fn generate_rppairing(
     hostname: &str,
 ) -> Result<RpPairingFile, IdeviceError> {
     let service = RemotePairingLockdownService::connect(&*provider).await?;
-    let mut client = service.into_client(&hostname).expect("no socket");
+    let mut client = service.into_client(hostname)?;
 
     let mut pairing_file = RpPairingFile::generate(&hostname);
     client
@@ -190,15 +190,19 @@ async fn place_individual_file(
     pairing: Vec<u8>,
     path: String,
 ) -> Result<(), AppError> {
-    afc_client
-        .mk_dir(format!(
-            "/Documents/{}",
-            path.rsplit_once('/').map(|x| x.0).unwrap_or("")
-        ))
-        .await
-        .map_err(|e| {
-            AppError::HouseArrest("Failed to create Documents directory".into(), e.to_string())
-        })?;
+    // VendDocuments exposes the existing Documents directory. Creating it again
+    // can return AFC_E_OBJECT_EXISTS before the pairing file is ever opened.
+    if let Some((parent, _)) = path.rsplit_once('/') {
+        match afc_client.mk_dir(format!("/Documents/{parent}")).await {
+            Ok(()) | Err(IdeviceError::Afc(AfcError::ObjectExists)) => {}
+            Err(error) => {
+                return Err(AppError::HouseArrest(
+                    "Failed to create pairing file directory".into(),
+                    error.to_string(),
+                ));
+            }
+        }
+    }
 
     let mut file = afc_client
         .open(
