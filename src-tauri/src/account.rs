@@ -1166,7 +1166,7 @@ mod tests {
             .unwrap_err();
         for report in [
             rootcause::report!("Received 429 Too Many Requests, no retries left"),
-            rootcause::report!(reqwest_middleware::Error::Reqwest(request_error)),
+            rootcause::report!(reqwest_middleware::Error::Reqwest(request_error)).into(),
         ] {
             let report = report.context("secret request URL");
             let error = classify_auth_error(report.into(), AuthStage::SignIn);
