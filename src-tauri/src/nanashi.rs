@@ -34,7 +34,7 @@ const MANAGER_SHA256: &str = "3bcfc4ef816abf1551ab31304040d8d556382657663e1f0b72
 const MANAGER_INFO_PATH: &str = "Payload/AltStore.app/Info.plist";
 const MANAGER_PAIRING_PATH: &str = "ALTPairingFile.plist";
 const NANASHI_IPA: &str =
-    "https://github.com/mkinvest57/nanashi/releases/download/v12.1.1/Nanashi-ios-v12.1.1.ipa";
+    "https://github.com/mkinvest57/nanashi/releases/download/v12.1.2/Nanashi-ios-v12.1.2-b447.ipa";
 const TEAM_TIMEOUT: Duration = Duration::from_secs(60);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(8 * 60);
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(60);
