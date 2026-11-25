@@ -89,9 +89,13 @@ impl PreservingAnisetteProvider {
     ) -> Result<Self, AppError> {
         // Upstream treats unreadable stored state as absent and has an unchecked
         // 16-byte conversion. Validate first, then load explicitly without replacing it.
-        let state_data = storage.retrieve_data(
-                isideload::anisette::remote_v3::ANISETTE_STATE_KEY,
-        ).map_err(|_| AppError::Keyring("Impossible de lire l’état de connexion dans le trousseau. Il est conservé sans modification.".into()))?;
+        let state_data = storage
+            .retrieve_data(isideload::anisette::remote_v3::ANISETTE_STATE_KEY)
+            .map_err(|_| {
+                AppError::Keyring(
+                    "Impossible de lire l’état de connexion dans le trousseau. Il est conservé sans modification.".into()
+                )
+            })?;
         if let Some(bytes) = state_data.as_ref() {
             validate_stored_anisette_state(bytes)?;
         }
@@ -372,7 +376,7 @@ async fn wait_for_two_factor_response(
 }
 
 #[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("{self:?}")]
+#[error("Apple sign-in stage")]
 enum AuthStage {
     Provider,
     Discovery,
