@@ -1,10 +1,10 @@
-use std::sync::Mutex;
+use std::{collections::HashSet, sync::Mutex, time::Duration};
 
 use idevice::{
     IdeviceService,
     lockdown::LockdownClient,
     provider::UsbmuxdProvider,
-    usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection},
+    usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection, UsbmuxdDevice},
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
@@ -83,92 +83,74 @@ fn cancel_pairing_selection(cancel_state: &PairingCancelToken, device_state: &De
     *device_state.lock().unwrap() = None;
 }
 
+const USB_TIMEOUT: Duration = Duration::from_secs(5);
+const TRUST_TIMEOUT: Duration = Duration::from_secs(120);
+
+// The wizard promises a cabled installation. A wireless advertisement may be
+// stale or arrive before the USB row for the same phone.
+fn wired_devices(devices: Vec<UsbmuxdDevice>) -> impl Iterator<Item = UsbmuxdDevice> {
+    let mut seen = HashSet::new();
+    devices
+        .into_iter()
+        .filter(move |d| d.connection_type == Connection::Usb && seen.insert(d.udid.clone()))
+}
+
+async fn enumerate_usb(connection: &mut UsbmuxdConnection) -> Result<Vec<UsbmuxdDevice>, AppError> {
+    tokio::time::timeout(USB_TIMEOUT, connection.get_devices())
+        .await
+        .map_err(|_| AppError::Usbmuxd("USB discovery timed out".into(), String::new()))?
+        .map_err(|_| AppError::Usbmuxd("USB discovery unavailable".into(), String::new()))
+}
+
+fn usb_address() -> Result<UsbmuxdAddr, AppError> {
+    UsbmuxdAddr::from_env_var()
+        .map_err(|_| AppError::Usbmuxd("Invalid usbmux address".into(), String::new()))
+}
+
+async fn describe_device(d: UsbmuxdDevice, address: UsbmuxdAddr) -> Result<DeviceInfo, AppError> {
+    let error = || AppError::DeviceComs("Unable to read iPhone information over USB".into());
+    let provider = d.to_provider(address, "iloader");
+    let mut lockdown = LockdownClient::connect(&provider)
+        .await
+        .map_err(|_| error())?;
+    let version = lockdown
+        .get_value(Some("ProductVersion"), None)
+        .await
+        .map_err(|_| error())?;
+    let version = version.as_string().ok_or_else(error)?.to_owned();
+    let name = lockdown
+        .get_value(Some("DeviceName"), None)
+        .await
+        .ok()
+        .and_then(|value| value.as_string().map(str::to_owned))
+        .unwrap_or_else(|| "iPhone".into());
+    Ok(DeviceInfo {
+        name,
+        version,
+        id: d.device_id,
+        udid: d.udid,
+        connection_type: "USB".into(),
+    })
+}
+
 #[tauri::command]
 pub async fn list_devices() -> Result<Vec<Result<DeviceInfo, AppError>>, AppError> {
-    let mut usbmuxd = get_usbmuxd().await?;
-
-    let devs = usbmuxd.get_devices().await.map_err(|e| {
-        AppError::Usbmuxd("Failed to list devices from usbmuxd".into(), e.to_string())
-    })?;
-    if devs.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let usbmuxd_addr = UsbmuxdAddr::from_env_var().map_err(|e| {
-        AppError::Usbmuxd(
-            "Invalid usbmuxd address from environment".into(),
-            e.to_string(),
-        )
-    })?;
-
-    let device_info_futures: Vec<_> = devs
-        .iter()
-        .map(|d| {
-            let usbmuxd_addr = usbmuxd_addr.clone();
-            async move {
-                let provider = d.to_provider(usbmuxd_addr, "iloader");
-                let device_uid = d.device_id;
-                let connection_type = match d.connection_type {
-                    Connection::Usb => "USB",
-                    Connection::Network(_) => "Network",
-                    Connection::Unknown(_) => "Unknown",
-                }
-                .to_string();
-
-                let mut lockdown_client =
-                    LockdownClient::connect(&provider).await.map_err(|e| {
-                        eprintln!("Unable to connect to lockdown for {}: {e:?}", d.udid);
-                        AppError::DeviceComsWithMessage(
-                            "Unable to connect to lockdown".into(),
-                            e.to_string(),
-                        )
-                    })?;
-
-                let device_name_value = lockdown_client
-                    .get_value(Some("DeviceName"), None)
-                    .await
-                    .map_err(|e| {
-                    eprintln!("Failed to fetch DeviceName for {}: {e:?}", d.udid);
-                    AppError::DeviceComsWithMessage(
-                        "Failed to fetch DeviceName".into(),
-                        e.to_string(),
-                    )
-                })?;
-
-                let device_name = device_name_value.as_string().ok_or_else(|| {
-                    eprintln!("DeviceName for {} was not a string", d.udid);
-                    AppError::DeviceComs("DeviceName was not a string".into())
-                })?;
-
-                let version_value = lockdown_client
-                    .get_value(Some("ProductVersion"), None)
-                    .await
-                    .map_err(|e| {
-                        eprintln!("Failed to fetch ProductVersion for {}: {e:?}", d.udid);
-                        AppError::DeviceComsWithMessage(
-                            "Failed to fetch ProductVersion".into(),
-                            e.to_string(),
-                        )
-                    })?;
-
-                let version = version_value.as_string().ok_or_else(|| {
-                    eprintln!("ProductVersion for {} was not a string", d.udid);
-                    AppError::DeviceComs("Product version was not a string".into())
-                })?;
-
-                Ok::<DeviceInfo, AppError>(DeviceInfo {
-                    name: device_name.to_string(),
-                    id: device_uid,
-                    udid: d.udid.clone(),
-                    connection_type,
-                    version: version.to_string(),
+    let mut connection = get_usbmuxd().await?;
+    let devices = enumerate_usb(&mut connection).await?;
+    let address = usb_address()?;
+    let descriptions = wired_devices(devices).map(|device| {
+        let address = address.clone();
+        async move {
+            tokio::time::timeout(USB_TIMEOUT, describe_device(device, address))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(AppError::DeviceComs(
+                        "USB device information timed out".into(),
+                    ))
                 })
-            }
-        })
-        .collect();
-
-    let device_infos = futures::future::join_all(device_info_futures).await;
-    Ok(device_infos)
+        }
+    });
+    Ok(futures::future::join_all(descriptions).await)
 }
 
 #[tauri::command]
@@ -189,7 +171,11 @@ pub async fn set_selected_device(
         _ = attempt.token.cancelled() => return Err(AppError::Canceled("Association de l’iPhone".into())),
         connection = get_usbmuxd() => connection?,
     };
-    let pairing = pairing_file(&app, &device, &mut usbmuxd, attempt.token.clone()).await?;
+    let pairing = tokio::select! {
+        _ = attempt.token.cancelled() => return Err(AppError::Canceled("Association de l’iPhone".into())),
+        result = tokio::time::timeout(TRUST_TIMEOUT, pairing_file(&app, &device, &mut usbmuxd, attempt.token.clone())) =>
+            result.map_err(|_| AppError::LockdownPairing("Pairing timed out".into(), String::new()))??,
+    };
     commit_selected_device(
         &cancel_state,
         &device_state,
@@ -212,8 +198,9 @@ pub async fn cancel_pairing(
 }
 
 pub async fn get_usbmuxd() -> Result<UsbmuxdConnection, AppError> {
-    UsbmuxdConnection::default()
+    tokio::time::timeout(USB_TIMEOUT, UsbmuxdConnection::default())
         .await
+        .map_err(|_| AppError::Usbmuxd("USB connection timed out".into(), String::new()))?
         .map_err(|e| AppError::Usbmuxd("Failed to connect to usbmuxd".into(), e.to_string()))
 }
 
@@ -225,15 +212,10 @@ pub async fn get_provider_from_connection(
     device_info: &DeviceInfo,
     connection: &mut UsbmuxdConnection,
 ) -> Result<UsbmuxdProvider, AppError> {
-    let device = connection
-        .get_device(&device_info.udid)
-        .await
-        .map_err(|e| {
-            AppError::DeviceComsWithMessage("Failed to get device".into(), e.to_string())
-        })?;
-
-    let provider = device.to_provider(UsbmuxdAddr::from_env_var().unwrap(), "iloader");
-    Ok(provider)
+    let device = wired_devices(enumerate_usb(connection).await?)
+        .find(|device| device.udid == device_info.udid)
+        .ok_or_else(|| AppError::DeviceComs("Selected iPhone is no longer on USB".into()))?;
+    Ok(device.to_provider(usb_address()?, "iloader"))
 }
 
 #[cfg(test)]
@@ -252,6 +234,27 @@ mod selection_tests {
             },
             pairing: vec![1, 2, 3],
         }
+    }
+
+    #[test]
+    fn usb_resolution_ignores_wireless_twins_and_preserves_distinct_phones() {
+        let row = |device_id, udid: &str, connection_type| UsbmuxdDevice {
+            device_id,
+            udid: udid.into(),
+            connection_type,
+        };
+        let wireless = Connection::Network("127.0.0.1".parse().unwrap());
+        let rows = vec![
+            row(1, "A", wireless.clone()),
+            row(2, "B", wireless),
+            row(3, "A", Connection::Usb),
+            row(4, "C", Connection::Usb),
+            row(5, "A", Connection::Usb),
+        ];
+        assert_eq!(
+            wired_devices(rows).map(|d| d.device_id).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { FiCheck, FiRefreshCw, FiSmartphone } from "react-icons/fi";
 import type { DeviceInfo } from "../Device";
@@ -20,44 +20,59 @@ export function NanashiDevice({ selectedDevice, onSelect, onBusyChange, minimumI
   const [loading, setLoading] = useState(false);
   const [pairing, setPairing] = useState<DeviceInfo | null>(null);
   const [error, setError] = useState<unknown>(null);
+  const [pairingError, setPairingError] = useState<unknown>(null);
+  const scanning = useRef(false);
+  const pairingActive = useRef(false);
   const generation = useRef(0);
   const mounted = useRef(true);
 
-  async function refresh() {
+  async function refresh(background = false) {
+    if (scanning.current || pairingActive.current) return;
+    scanning.current = true;
     const request = ++generation.current;
-    setLoading(true); setError(null); onBusyChange(true);
+    if (!background) { setLoading(true); setError(null); setPairingError(null); onBusyChange(true); }
     try {
       const results = await invoke<Array<{ Ok: DeviceInfo } | { Err: unknown }>>("list_devices");
       if (!mounted.current || request !== generation.current) return;
       const found = results.flatMap(result => "Ok" in result ? [result.Ok] : []);
       setDevices(found);
-      if (!found.length) {
-        const failed = results.find(result => "Err" in result);
-        if (failed && "Err" in failed) setError(failed.Err);
-      }
+      const failed = results.find(result => "Err" in result);
+      setError(failed && "Err" in failed ? failed.Err : null);
       if (selectedDevice && !found.some(device => device.udid === selectedDevice.udid)) onSelect(null);
     } catch (failure) {
       if (mounted.current && request === generation.current) { setError(failure); setDevices([]); onSelect(null); }
     } finally {
-      if (mounted.current && request === generation.current) { setLoading(false); onBusyChange(false); }
+      if (request === generation.current) {
+        scanning.current = false;
+        if (mounted.current && !background) { setLoading(false); onBusyChange(false); }
+      }
     }
   }
   async function select(device: DeviceInfo) {
     const request = ++generation.current;
-    setPairing(device); setError(null); onBusyChange(true); onSelect(null);
+    scanning.current = false; pairingActive.current = true;
+    setPairing(device); setError(null); setPairingError(null); onBusyChange(true); onSelect(null);
     try {
       await invoke("set_selected_device", { device });
       if (mounted.current && request === generation.current) onSelect(device);
-    } catch (failure) { if (mounted.current && request === generation.current) setError(failure); }
-    finally { if (mounted.current && request === generation.current) { setPairing(null); onBusyChange(false); } }
+    } catch (failure) { if (mounted.current && request === generation.current) setPairingError(failure); }
+    finally { if (mounted.current && request === generation.current) { pairingActive.current = false; setPairing(null); onBusyChange(false); } }
   }
   async function cancelPairing() {
-    try { await invoke("cancel_pairing"); generation.current += 1; setPairing(null); onSelect(null); onBusyChange(false); }
+    try { await invoke("cancel_pairing"); generation.current += 1; pairingActive.current = false; setPairing(null); onSelect(null); onBusyChange(false); }
     catch (failure) { setError(failure); }
   }
+  const scan = useEffectEvent((background: boolean) => { void refresh(background); });
   useEffect(() => {
-    mounted.current = true; void refresh();
-    return () => { mounted.current = false; generation.current += 1; onBusyChange(false); };
+    mounted.current = true; scan(false);
+    const detect = () => { if (document.visibilityState === "visible") scan(true); };
+    const timer = window.setInterval(detect, 3000);
+    document.addEventListener("visibilitychange", detect);
+    return () => {
+      mounted.current = false; generation.current += 1; scanning.current = false;
+      window.clearInterval(timer); document.removeEventListener("visibilitychange", detect);
+      onBusyChange(false);
+    };
   }, []);
   return <div className="ni-device-list">
     {loading && <p role="status">Recherche des iPhone branchés…</p>}
@@ -67,7 +82,7 @@ export function NanashiDevice({ selectedDevice, onSelect, onBusyChange, minimumI
       {selectedDevice?.udid === device.udid && <FiCheck aria-label="Sélectionné" />}
     </button>)}
     {pairing && <div className="ni-notice" role="status"><strong>Confirmez sur {pairing.name}</strong><p>Gardez l’iPhone déverrouillé et acceptez la demande de confiance si elle apparaît.</p><button className="ni-text-button" type="button" onClick={() => void cancelPairing()}>Annuler la sélection</button></div>}
-    {error !== null && <NanashiError error={error} />}
+    {(pairingError ?? error) != null && <NanashiError error={pairingError ?? error} />}
     <NanashiButton type="button" disabled={loading || pairing !== null} onClick={() => void refresh()}><FiRefreshCw aria-hidden="true" />Rechercher à nouveau</NanashiButton>
   </div>;
 }

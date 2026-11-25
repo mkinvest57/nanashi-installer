@@ -20,7 +20,7 @@ async function fixture(scenario = "success", viewport = { width: 980, height: 76
     function notify(event, payload) {
       for (const [listenerId, listener] of listeners) if (listener.event === event) callbacks.get(listener.handler)?.({ event, id: listenerId, payload });
     }
-    window.__nanashiMock = { calls, listeners, devices: scenario === "two-devices" ? [device, { ...device, id: 2, udid: "SECOND-TEST-DEVICE", name: "Autre iPhone" }] : [device] };
+    window.__nanashiMock = { calls, listeners, demo: device, devices: scenario === "hotplug" ? [] : scenario === "two-devices" ? [device, { ...device, id: 2, udid: "SECOND-TEST-DEVICE", name: "Autre iPhone" }] : [device] };
     window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: (_event, listenerId) => listeners.delete(listenerId) };
     window.__TAURI_INTERNALS__ = {
       transformCallback(callback) { const callbackId = ++id; callbacks.set(callbackId, callback); return callbackId; },
@@ -159,6 +159,21 @@ await run("Apple -80045 is visible without raw response or automatic retries", a
   await expect(page.locator("body")).not.toContainText("FAKE_SECRET_DO_NOT_DISPLAY");
   await expect(page.getByLabel("Mot de passe", { exact: true })).toHaveValue("");
   expect(await page.evaluate(() => window.__nanashiMock.calls.filter(call => call.command === "login_new").length)).toBe(1);
+  expect(errors).toEqual([]); await context.close();
+});
+await run("a phone plugged in after launch appears automatically without starting pairing", async () => {
+  const { context, page, errors } = await fixture("hotplug");
+  const next = page.getByRole("button", { name: "Continuer", exact: true });
+  await expect(next).toBeDisabled();
+  await expect(page.getByText("Branchez votre iPhone", { exact: true })).toBeVisible();
+  await page.evaluate(() => { window.__nanashiMock.devices.push(window.__nanashiMock.demo); });
+  const phone = page.getByRole("button", { name: /iPhone de démo/ });
+  await expect(phone).toBeVisible({ timeout: 8500 });
+  expect(await page.evaluate(() => window.__nanashiMock.calls.filter(c => c.command === "set_selected_device").length)).toBe(0);
+  await phone.click();
+  await expect(next).toBeEnabled();
+  await page.evaluate(() => { window.__nanashiMock.devices = []; });
+  await expect(next).toBeDisabled({ timeout: 8500 });
   expect(errors).toEqual([]); await context.close();
 });
 await run("real udid identity distinguishes phones and invalidates stale preparation", async () => {
