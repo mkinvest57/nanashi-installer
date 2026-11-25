@@ -35,7 +35,12 @@ if [[ ! -f "$binary" || ! -x "$binary" ]]; then
   echo 'The app executable is missing.' >&2
   exit 1
 fi
-lipo -verify_arch arm64 x86_64 "$binary"
+architecture_output="$(xcrun lipo -archs "$binary")"
+read -r -a architectures <<< "$architecture_output"
+if [[ " ${architectures[*]} " != *' arm64 '* || " ${architectures[*]} " != *' x86_64 '* ]]; then
+  echo 'The app executable must contain both arm64 and x86_64 architectures.' >&2
+  exit 1
+fi
 
 mkdir -p "$artifact_directory" "$recovery_directory"
 stage_directory="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/nanashi-dmg.XXXXXX")"
