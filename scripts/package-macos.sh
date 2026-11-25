@@ -46,13 +46,19 @@ mkdir -p "$artifact_directory" "$recovery_directory"
 stage_directory="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/nanashi-dmg.XXXXXX")"
 trap 'rm -rf -- "$stage_directory"' EXIT
 
+mkdir "$stage_directory/content"
+staged_app="$stage_directory/content/Nanashi Installer.app"
+ditto "$app_bundle" "$staged_app"
+# This preview has no Developer ID identity. Seal both executable slices and
+# the resources together so each architecture can verify the same app bundle.
+codesign --force --sign - --timestamp=none "$staged_app"
+codesign --verify --deep --strict --all-architectures "$staged_app"
+
 # Keep a validated .app archive even if disk-image creation fails later. This
 # is a CI recovery artifact, not a replacement for the verified release DMG.
-ditto -c -k --sequesterRsrc --keepParent "$app_bundle" "$stage_directory/mac-app.zip"
+ditto -c -k --sequesterRsrc --keepParent "$staged_app" "$stage_directory/mac-app.zip"
 mv -f -- "$stage_directory/mac-app.zip" "$recovery_directory/Nanashi-Installer-macOS-app.zip"
 
-mkdir "$stage_directory/content"
-ditto "$app_bundle" "$stage_directory/content/Nanashi Installer.app"
 ln -s /Applications "$stage_directory/content/Applications"
 hdiutil create -volname 'Nanashi Installer' -fs HFS+ -format UDZO \
   -srcfolder "$stage_directory/content" "$stage_directory/Nanashi-Installer-macOS.dmg"
